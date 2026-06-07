@@ -117,13 +117,17 @@ def sign_manifest(manifest_hash: str, key: Ed25519PrivateKey) -> str:
 def verify_manifest(manifest_hash: str, sig_hex: str, public_key_bytes: bytes) -> bool:
     """Verify an Ed25519 signature over *manifest_hash*.
 
-    Returns True on success, False on InvalidSignature (never raises for
-    bad signatures — only raises for programming errors such as a malformed
-    key or non-hex sig_hex).
+    Returns True on success, False on bad or unverifiable signatures (including
+    malformed hex). Never raises for bad signatures - only raises for programming
+    errors such as a malformed public key.
     """
     pub = Ed25519PublicKey.from_public_bytes(public_key_bytes)
     try:
-        pub.verify(bytes.fromhex(sig_hex), manifest_hash.encode("utf-8"))
+        sig_bytes = bytes.fromhex(sig_hex)
+    except ValueError:
+        return False
+    try:
+        pub.verify(sig_bytes, manifest_hash.encode("utf-8"))
         return True
     except InvalidSignature:
         return False

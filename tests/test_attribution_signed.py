@@ -27,8 +27,8 @@ from zephyr.attribution import (
     record_signed,
     verify_row,
 )
-from zephyr.registry import PubkeyRegistry, _reset_registry
-from zephyr.signing import AgentSigner, _reset_signer
+from zephyr.registry import PubkeyRegistry
+from zephyr.signing import AgentSigner
 
 
 # ---------------------------------------------------------------------------

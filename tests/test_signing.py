@@ -12,12 +12,10 @@ from zephyr.signing import (
     sign_manifest,
     verify_manifest,
     AgentSigner,
-    _reset_signer,
 )
 from zephyr.registry import (
     PubkeyRegistry,
     is_human_namespace,
-    _reset_registry,
 )
 
 
