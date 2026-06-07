@@ -7,7 +7,9 @@ name = "zephyr"
 version = "0.1.0"
 description = "Zephyr - node-collaboration work-record substrate (attribution log + deposit). In-vitro instance of the Zephyr envelope; rides archetypes_core.provenance."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "cryptography>=42",
+]
 
 [tool.setuptools.packages.find]
 include = ["zephyr*"]
