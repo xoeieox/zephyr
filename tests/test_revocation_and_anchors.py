@@ -362,6 +362,61 @@ def test_verify_row_compromise_after_window(tmp_registry, tmp_signer):
     assert vr.status == "suspect"
 
 
+def test_rotation_leaves_both_old_and_new_keys(tmp_registry, tmp_signer):
+    """AC3: rotation workflow (add new, revoke old) leaves both keys in registry."""
+    # Register original key
+    old_pkid = tmp_signer.pubkey_id_str
+    tmp_registry.register(
+        old_pkid,
+        tmp_signer.public_key_bytes.hex(),
+        "agent:test",
+        role="agent",
+    )
+
+    # Create a new signer (simulating key rotation)
+    from zephyr.signing import AgentSigner
+    from pathlib import Path
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        new_signer = AgentSigner(Path(tmpdir) / "new.key")
+        new_pkid = new_signer.pubkey_id_str
+
+        # Register new key
+        tmp_registry.register(
+            new_pkid,
+            new_signer.public_key_bytes.hex(),
+            "agent:test",
+            role="agent",
+        )
+
+        # Revoke old key with reason="rotated"
+        tmp_registry.revoke(old_pkid, reason="rotated")
+
+        # Both keys should be in the registry
+        old_entry = tmp_registry.lookup(old_pkid)
+        new_entry = tmp_registry.lookup(new_pkid)
+
+        assert old_entry is not None
+        assert new_entry is not None
+        assert old_entry["status"] == "revoked"
+        assert old_entry["revoked_reason"] == "rotated"
+        assert new_entry["status"] == "active"
+
+        # Old key's deposits should still verify (clean retirement)
+        mh = "sha256:rotation-old-key-verify"
+        sig = tmp_signer.sign(mh)
+        row = {
+            "manifest_hash": mh,
+            "agent_id": "agent:test",
+            "signature": sig,
+            "pubkey_id": old_pkid,
+            "timestamp": "2026-06-01T00:00:00+00:00",
+        }
+        vr = verify_row(row, registry=tmp_registry)
+        assert vr.verified is True
+        assert vr.status == "verified"
+
+
 def test_verify_row_compromise_advisory_marker_for_node(tmp_registry, tmp_signer):
     """Compromise after-window detail marks node keys as advisory."""
     node_binding = {"node": "brix", "hostname": "brix", "tailscale_ip": "1.2.3.4"}
@@ -390,6 +445,39 @@ def test_verify_row_compromise_advisory_marker_for_node(tmp_registry, tmp_signer
     vr = verify_row(row, registry=tmp_registry)
     assert vr.verified is False
     assert "advisory" in vr.detail.lower()
+
+
+def test_verify_row_compromise_before_window_advisory_marker_for_node(tmp_registry, tmp_signer):
+    """AC5: Compromise before-window detail marks node keys as advisory (not cryptographic)."""
+    node_binding = {"node": "brix", "hostname": "brix", "tailscale_ip": "1.2.3.4"}
+    tmp_registry.register(
+        tmp_signer.pubkey_id_str,
+        tmp_signer.public_key_bytes.hex(),
+        "agent:test",
+        role="node",
+        node_binding=node_binding,
+    )
+    tmp_registry.revoke(
+        tmp_signer.pubkey_id_str,
+        reason="compromised",
+        suspected_at="2026-06-05T00:00:00+00:00",
+    )
+
+    mh = "sha256:before-compromise-advisory"
+    sig = tmp_signer.sign(mh)
+    row = {
+        "manifest_hash": mh,
+        "agent_id": "agent:test",
+        "signature": sig,
+        "pubkey_id": tmp_signer.pubkey_id_str,
+        "timestamp": "2026-06-01T00:00:00+00:00",  # before compromise window
+    }
+    vr = verify_row(row, registry=tmp_registry)
+    assert vr.verified is True
+    assert vr.status == "verified"
+    # Must distinguish advisory (node key) from cryptographic (human key)
+    assert "advisory" in vr.detail.lower()
+    assert "node" in vr.detail.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -540,14 +628,19 @@ def test_anchor_chain_unset_anchor_rejects_human(tmp_log, tmp_registry, tmp_sign
         with pytest.raises(PermissionError, match="[Nn]o.*anchor.*configured"):
             tmp_log.record(prov, registry=tmp_registry)
     finally:
+        zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = old_mod
         if old is not None:
             os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = old
+        else:
+            os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
 
 
 def test_anchor_chain_verify_happy_path(tmp_registry, anchor_signer, tmp_signer):
     """A human entry with valid registered_by signature from anchor is trusted."""
     # Set anchor
     import zephyr.registry
+    old = os.environ.get("ZEPHYR_HUMAN_ROOT_ANCHOR")
+    old_mod = zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR
     anchor_pkid = anchor_signer.pubkey_id_str
     os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = anchor_pkid
     zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = anchor_pkid
@@ -594,12 +687,18 @@ def test_anchor_chain_verify_happy_path(tmp_registry, anchor_signer, tmp_signer)
         assert "signature verified" in detail.lower()
 
     finally:
-        os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
+        zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = old_mod
+        if old is not None:
+            os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = old
+        else:
+            os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
 
 
 def test_anchor_chain_attack_invalid_signature(tmp_registry, anchor_signer, tmp_signer):
     """A human entry with an invalid registered_by signature is not trusted."""
     import zephyr.registry
+    old = os.environ.get("ZEPHYR_HUMAN_ROOT_ANCHOR")
+    old_mod = zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR
     anchor_pkid = anchor_signer.pubkey_id_str
     os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = anchor_pkid
     zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = anchor_pkid
@@ -631,7 +730,11 @@ def test_anchor_chain_attack_invalid_signature(tmp_registry, anchor_signer, tmp_
         assert "signature" in detail.lower()
 
     finally:
-        os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
+        zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = old_mod
+        if old is not None:
+            os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = old
+        else:
+            os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
 
 
 def test_anchor_chain_attack_wrong_signer(tmp_path, tmp_registry, tmp_signer):
@@ -639,6 +742,8 @@ def test_anchor_chain_attack_wrong_signer(tmp_path, tmp_registry, tmp_signer):
     import json
     import zephyr.registry
 
+    old = os.environ.get("ZEPHYR_HUMAN_ROOT_ANCHOR")
+    old_mod = zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR
     anchor_pkid = "ed25519:aaaaaaaaaaaaaaaa"  # fake anchor
     os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = anchor_pkid
     zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = anchor_pkid
@@ -671,7 +776,69 @@ def test_anchor_chain_attack_wrong_signer(tmp_path, tmp_registry, tmp_signer):
         assert "not the pinned anchor" in detail
 
     finally:
-        os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
+        zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = old_mod
+        if old is not None:
+            os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = old
+        else:
+            os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
+
+
+# ---------------------------------------------------------------------------
+# AC10a — Human-key revocation gating
+# ---------------------------------------------------------------------------
+
+
+def test_revoke_human_key_requires_credential(tmp_registry, anchor_signer, tmp_signer):
+    """AC10a: Revoking a human key without credential_credential raises PermissionError."""
+    import zephyr.registry
+    old = os.environ.get("ZEPHYR_HUMAN_ROOT_ANCHOR")
+    old_mod = zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR
+    anchor_pkid = anchor_signer.pubkey_id_str
+    os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = anchor_pkid
+    zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = anchor_pkid
+
+    try:
+        # Register anchor
+        tmp_registry.register(
+            anchor_pkid,
+            anchor_signer.public_key_bytes.hex(),
+            "human:root",
+            role="human",
+        )
+
+        # Register a human key
+        import json
+        from datetime import datetime, timezone
+        human_pkid = tmp_signer.pubkey_id_str
+        human_pub_hex = tmp_signer.public_key_bytes.hex()
+        human_agent_id = "human:alice-synthetic"
+        valid_from = datetime.now(timezone.utc).isoformat()
+
+        signing_target = json.dumps(
+            [human_pkid, human_pub_hex, human_agent_id, valid_from],
+            separators=(",", ":"),
+        )
+        sig = anchor_signer.sign(signing_target)
+
+        tmp_registry.register(
+            human_pkid,
+            human_pub_hex,
+            human_agent_id,
+            role="human",
+            valid_from=valid_from,
+            registered_by={"signer_pkid": anchor_pkid, "signature": sig},
+        )
+
+        # Try to revoke without credential — should fail
+        with pytest.raises(PermissionError, match="requires a valid caller_credential"):
+            tmp_registry.revoke(human_pkid, reason="retired")
+
+    finally:
+        zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = old_mod
+        if old is not None:
+            os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = old
+        else:
+            os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +850,8 @@ def test_revoked_human_key_rejected_at_write(tmp_log, tmp_registry, anchor_signe
     """A human key revoked cannot be used for new deposits."""
     import zephyr.registry
     from datetime import datetime, timezone
+    old = os.environ.get("ZEPHYR_HUMAN_ROOT_ANCHOR")
+    old_mod = zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR
     anchor_pkid = anchor_signer.pubkey_id_str
     os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = anchor_pkid
     zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = anchor_pkid
@@ -718,8 +887,14 @@ def test_revoked_human_key_rejected_at_write(tmp_log, tmp_registry, anchor_signe
             registered_by={"signer_pkid": anchor_pkid, "signature": sig},
         )
 
-        # Revoke it
-        tmp_registry.revoke(human_pkid, reason="retired")
+        # Revoke it with anchor credential (sign over [pkid, reason])
+        revoke_target = json.dumps([human_pkid, "retired"], separators=(",", ":"))
+        revoke_sig = anchor_signer.sign(revoke_target)
+        tmp_registry.revoke(
+            human_pkid,
+            reason="retired",
+            caller_credential={"signer_pkid": anchor_pkid, "signature": revoke_sig},
+        )
 
         # Try to deposit with revoked key
         mh = "sha256:revoked-human-test"
@@ -737,13 +912,19 @@ def test_revoked_human_key_rejected_at_write(tmp_log, tmp_registry, anchor_signe
             tmp_log.record(prov, registry=tmp_registry)
 
     finally:
-        os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
+        zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = old_mod
+        if old is not None:
+            os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = old
+        else:
+            os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
 
 
 def test_non_revoked_human_deposits_with_anchor_chain(tmp_log, tmp_registry, anchor_signer, tmp_signer):
     """A human key that is anchor-trusted and active can deposit."""
     import zephyr.registry
     from datetime import datetime, timezone
+    old = os.environ.get("ZEPHYR_HUMAN_ROOT_ANCHOR")
+    old_mod = zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR
     anchor_pkid = anchor_signer.pubkey_id_str
     os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = anchor_pkid
     zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = anchor_pkid
@@ -795,4 +976,8 @@ def test_non_revoked_human_deposits_with_anchor_chain(tmp_log, tmp_registry, anc
         assert tmp_log.record(prov, registry=tmp_registry) is True
 
     finally:
-        os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)
+        zephyr.registry.ZEPHYR_HUMAN_ROOT_ANCHOR = old_mod
+        if old is not None:
+            os.environ["ZEPHYR_HUMAN_ROOT_ANCHOR"] = old
+        else:
+            os.environ.pop("ZEPHYR_HUMAN_ROOT_ANCHOR", None)

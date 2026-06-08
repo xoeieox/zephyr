@@ -419,8 +419,7 @@ def verify_row(
       unsigned    -- no signature (v0 row or observe-mode deposit)
       unknown_key -- signature present but pubkey_id not in registry
       invalid     -- signature present but verification failed
-      revoked_key -- signature valid but key revoked and reason=compromised
-                     and row within compromise window (subset of suspect for strict mode)
+      revoked_key -- signature valid but key revoked and reason is unknown/missing
     """
     from zephyr.registry import get_registry
     from zephyr.signing import verify_manifest
@@ -494,13 +493,15 @@ def verify_row(
             # String comparison (ISO8601 sorts lexicographically)
             is_before_compromise = row_timestamp < compromise_suspected
             if is_before_compromise:
+                role = entry.get("role")
+                advisory_marker = " (advisory; node/agent key, timestamp self-asserted)" if role in ("node", "agent") else " (cryptographic; human key, anchor-chained)"
                 return VerificationResult(
                     status="verified",
                     verified=True,
                     pubkey_id=pkid,
                     assurance_tier=entry.get("assurance_tier"),
                     detail=f"key compromised at {compromise_suspected}; "
-                    f"deposit signed before ({row_timestamp}) — cryptographic if human role",
+                    f"deposit signed before ({row_timestamp}) — before suspect window{advisory_marker}",
                 )
 
             # Signature valid but within compromise window

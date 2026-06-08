@@ -167,6 +167,7 @@ class PubkeyRegistry:
         reason: str,
         suspected_at: str | None = None,
         note: str = "",
+        caller_credential: dict | None = None,
     ) -> dict:
         """Revoke a registered key (idempotent; once revoked, always revoked).
 
@@ -175,16 +176,20 @@ class PubkeyRegistry:
         the compromise was suspected. If omitted and reason="compromised",
         defaults to revoked_at and logs a warning that the window is unknown.
 
+        For role='human' entries: *caller_credential* is required. It must be a dict
+        with {signer_pkid, signature}, containing a signature from an anchor-trusted
+        active human-key over the canonical target: json.dumps([pkid, reason]).
+        Node/agent keys may be revoked without a credential.
+
         Monotonic: revoking an already-revoked key returns the existing entry unchanged.
         There is no un-revoke; re-trust = register a new key.
 
         Returns the revoked entry.
 
-        NOTE: This method does NOT enforce human-key authorization here; that gating
-        lives in attribution.record() per §2 of the spec (it's a write-path concern,
-        not a registry concern). A future binding may add a credential parameter
-        if registry enforcement becomes desirable.
+        Raises PermissionError if a human key is revoked without valid caller_credential.
         """
+        from zephyr.signing import verify_manifest
+
         if reason not in ("rotated", "retired", "compromised"):
             raise ValueError(
                 f"revoke: reason must be 'rotated', 'retired', or 'compromised', "
@@ -200,6 +205,72 @@ class PubkeyRegistry:
             return entry
 
         now = datetime.now(timezone.utc).isoformat()
+
+        # AC10a: Human-key revocation requires anchor-trusted caller credential
+        if entry.get("role") == "human":
+            if caller_credential is None:
+                raise PermissionError(
+                    f"revoke: human-role key {pkid!r} requires a valid caller_credential "
+                    f"(signature from an anchor-trusted active human key). "
+                    f"Revocation denied."
+                )
+
+            # Build the canonical signing target for the revocation
+            signing_target = json.dumps([pkid, reason], separators=(",", ":"))
+
+            # Validate caller_credential structure
+            signer_pkid = caller_credential.get("signer_pkid")
+            signature = caller_credential.get("signature")
+            if not signer_pkid or not signature:
+                raise PermissionError(
+                    f"revoke: caller_credential missing signer_pkid or signature"
+                )
+
+            # Look up the signer key
+            signer_entry = self.lookup(signer_pkid)
+            if signer_entry is None:
+                raise PermissionError(
+                    f"revoke: caller signer_pkid={signer_pkid!r} not in registry"
+                )
+
+            # Signer must be human, active, and anchor-trusted
+            if signer_entry.get("role") != "human":
+                raise PermissionError(
+                    f"revoke: caller key {signer_pkid!r} has role={signer_entry.get('role')!r}, "
+                    f"not 'human'. Only human-role keys may revoke human keys."
+                )
+
+            if signer_entry.get("status") == "revoked":
+                raise PermissionError(
+                    f"revoke: caller key {signer_pkid!r} is revoked and cannot authorize revocations"
+                )
+
+            trusted, chain_detail = verify_human_anchor_chain(signer_entry, registry=self)
+            if not trusted:
+                raise PermissionError(
+                    f"revoke: caller key {signer_pkid!r} is not anchor-trusted. "
+                    f"{chain_detail} — revocation denied."
+                )
+
+            # Verify the signature over the revocation target
+            signer_pubkey_hex = signer_entry.get("public_key_hex")
+            if not signer_pubkey_hex:
+                raise PermissionError(
+                    f"revoke: caller key {signer_pkid!r} has no public_key_hex"
+                )
+
+            try:
+                signer_pubkey_bytes = bytes.fromhex(signer_pubkey_hex)
+            except ValueError:
+                raise PermissionError(
+                    f"revoke: caller key {signer_pkid!r} public_key_hex is invalid"
+                )
+
+            if not verify_manifest(signing_target, signature, signer_pubkey_bytes):
+                raise PermissionError(
+                    f"revoke: caller_credential signature does not verify"
+                )
+
         entry["status"] = "revoked"
         entry["revoked_at"] = now
         entry["revoked_reason"] = reason
