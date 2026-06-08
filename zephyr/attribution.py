@@ -82,9 +82,12 @@ class VerificationResult:
     """Result of verifying a single deposit row at read time."""
 
     status: str
-    """One of: ``verified``, ``unsigned``, ``invalid``, ``unknown_key``."""
+    """One of: ``verified``, ``unsigned``, ``invalid``, ``unknown_key``,
+    ``revoked_key``, ``suspect``."""
     verified: bool
     pubkey_id: str | None = None
+    assurance_tier: str | None = None
+    """Assurance tier of the signing key (if verified/revoked/suspect)."""
     detail: str | None = None
 
 
@@ -139,17 +142,28 @@ class AttributionLog:
     ) -> bool:
         """Append a deposit's provenance.
 
-        Enforcement order:
+        Enforcement order (per agent-key-management spec §2):
         1. manifest_hash required.
         2. Tier-0 human-namespace guard (unconditional, regardless of signing mode).
-        3. If signature present: verify (invalid sig is always fatal).
-        4. No signature: mode-gated (observe: warn+store NULL; enforce: reject).
-        5. Store (INSERT OR IGNORE on manifest_hash).
+           - Requires signature + pubkey_id.
+           - Key must be role='human' and anchor-trusted.
+           - Key must not be revoked (strict: no compromise window).
+           - Exact-match on agent_id.
+        3. Node-vouches rule: if signing key role='node', permit any non-human agent_id.
+           Otherwise (role='agent'), require exact agent_id match.
+           Reject revoked keys (same as human: cannot deposit with revoked key).
+        4. If signature present (non-human): verify (invalid sig is always fatal).
+        5. No signature: mode-gated (observe: warn+store NULL; enforce: reject).
+        6. Store (INSERT OR IGNORE on manifest_hash).
 
         Returns True if newly recorded, False if duplicate (idempotent).
         *registry* defaults to the process singleton; pass explicitly in tests.
         """
-        from zephyr.registry import get_registry, is_human_namespace
+        from zephyr.registry import (
+            get_registry,
+            is_human_namespace,
+            verify_human_anchor_chain,
+        )
         from zephyr.signing import verify_manifest
 
         mh = provenance.get("manifest_hash")
@@ -189,6 +203,25 @@ class AttributionLog:
                     f"key {pkid!r} is registered to agent_id={entry.get('agent_id')!r}. "
                     f"Key/identity mismatch — deposit rejected."
                 )
+
+            # Check anchor-chain: human key must be anchor-trusted
+            trusted, chain_detail = verify_human_anchor_chain(entry, registry=reg)
+            if not trusted:
+                raise PermissionError(
+                    f"Tier-0 guard: human-namespace deposit for agent_id={agent_id!r}: "
+                    f"key {pkid!r} is not anchor-trusted. {chain_detail} — "
+                    f"Deposit rejected."
+                )
+
+            # Check revocation: human keys must be active (no compromise window at write time)
+            if entry.get("status") == "revoked":
+                raise PermissionError(
+                    f"Tier-0 guard: human-namespace deposit for agent_id={agent_id!r}: "
+                    f"key {pkid!r} is revoked (reason={entry.get('revoked_reason')!r}). "
+                    f"Deposit rejected."
+                )
+
+            # Verify signature
             pub_bytes = bytes.fromhex(entry["public_key_hex"])
             if not verify_manifest(mh, signature, pub_bytes):
                 raise PermissionError(
@@ -209,12 +242,37 @@ class AttributionLog:
                     f"Deposit carries unknown pubkey_id={pkid!r}. "
                     f"Register the key before depositing. agent_id={agent_id!r}"
                 )
-            if entry.get("agent_id") != agent_id:
+
+            # Reject deposits via revoked keys (can only deposit with active keys)
+            if entry.get("status") == "revoked":
                 raise ValueError(
-                    f"Key/agent mismatch: key {pkid!r} is registered to "
-                    f"agent_id={entry.get('agent_id')!r} but deposit claims "
-                    f"agent_id={agent_id!r} — deposit rejected."
+                    f"Deposit signed by revoked key {pkid!r} "
+                    f"(reason={entry.get('revoked_reason')!r}). "
+                    f"Cannot deposit with a revoked key. agent_id={agent_id!r} — "
+                    f"deposit rejected."
                 )
+
+            # Node-vouches rule: relax exact-match for node keys
+            signing_role = entry.get("role")
+            if signing_role == "node":
+                # Node can sign for any non-human agent_id
+                # (human-namespace already caught above, so we're safe)
+                pass
+            elif signing_role == "agent":
+                # Agent keys require exact agent_id match
+                if entry.get("agent_id") != agent_id:
+                    raise ValueError(
+                        f"Key/agent mismatch: key {pkid!r} is registered to "
+                        f"agent_id={entry.get('agent_id')!r} but deposit claims "
+                        f"agent_id={agent_id!r} — deposit rejected."
+                    )
+            else:
+                # Unknown role: reject (shouldn't happen if registry.register validates)
+                raise ValueError(
+                    f"Deposit signed by key {pkid!r} with unknown role={signing_role!r} — "
+                    f"deposit rejected."
+                )
+
             pub_bytes = bytes.fromhex(entry["public_key_hex"])
             if not verify_manifest(mh, signature, pub_bytes):
                 raise ValueError(
@@ -339,7 +397,7 @@ class AttributionLog:
 def verify_row(
     row: dict, registry: "PubkeyRegistry | None" = None
 ) -> VerificationResult:
-    """Re-verify a deposit row's signature at read time.
+    """Re-verify a deposit row's signature at read time, with revocation awareness.
 
     Never raises on a bad signature — surfaces status ``invalid`` instead.
     Reads are always safe even if the registry changes or a key is absent.
@@ -347,11 +405,22 @@ def verify_row(
     *registry* defaults to the process singleton (get_registry()); pass an
     explicit instance in tests to avoid touching the global singleton.
 
+    Revocation rule (per §3 of agent-key-management spec):
+      - Key active: signature valid → verified
+      - Key revoked, reason in {rotated, retired}: → verified (clean retirement, history OK)
+      - Key revoked, reason=compromised:
+          row.timestamp < compromise_suspected_at → verified
+          row.timestamp >= compromise_suspected_at → suspect (verified=False)
+      - (Signature mismatch is always invalid, regardless of key status)
+
     Statuses:
-      verified    -- signature present and valid
+      verified    -- signature present, valid, and key is active or cleanly retired
+      suspect     -- signature valid but key compromised and row timestamp in suspect window
       unsigned    -- no signature (v0 row or observe-mode deposit)
       unknown_key -- signature present but pubkey_id not in registry
       invalid     -- signature present but verification failed
+      revoked_key -- signature valid but key revoked and reason=compromised
+                     and row within compromise window (subset of suspect for strict mode)
     """
     from zephyr.registry import get_registry
     from zephyr.signing import verify_manifest
@@ -376,14 +445,85 @@ def verify_row(
 
         pub_bytes = bytes.fromhex(entry["public_key_hex"])
         ok = verify_manifest(mh, sig, pub_bytes)
-        if ok:
-            return VerificationResult(status="verified", verified=True, pubkey_id=pkid)
+        if not ok:
+            return VerificationResult(
+                status="invalid",
+                verified=False,
+                pubkey_id=pkid,
+                assurance_tier=entry.get("assurance_tier"),
+                detail="signature does not verify against registered pubkey",
+            )
+
+        # Signature is valid. Now check revocation status.
+        status = entry.get("status", "active")
+        if status == "active":
+            return VerificationResult(
+                status="verified",
+                verified=True,
+                pubkey_id=pkid,
+                assurance_tier=entry.get("assurance_tier"),
+            )
+
+        # Key is revoked. Check reason and compromise window.
+        revoked_reason = entry.get("revoked_reason")
+        if revoked_reason in ("rotated", "retired"):
+            # Clean retirement: signature is still valid regardless of timestamp
+            return VerificationResult(
+                status="verified",
+                verified=True,
+                pubkey_id=pkid,
+                assurance_tier=entry.get("assurance_tier"),
+                detail=f"key revoked ({revoked_reason}); signature valid before retirement",
+            )
+
+        if revoked_reason == "compromised":
+            # Check if deposit timestamp is before/after the suspected compromise
+            row_timestamp = row.get("timestamp")
+            compromise_suspected = entry.get("compromise_suspected_at")
+
+            if not row_timestamp or not compromise_suspected:
+                # Can't determine: treat as suspect
+                return VerificationResult(
+                    status="suspect",
+                    verified=False,
+                    pubkey_id=pkid,
+                    assurance_tier=entry.get("assurance_tier"),
+                    detail="key compromised but cannot determine if deposit predates compromise",
+                )
+
+            # String comparison (ISO8601 sorts lexicographically)
+            is_before_compromise = row_timestamp < compromise_suspected
+            if is_before_compromise:
+                return VerificationResult(
+                    status="verified",
+                    verified=True,
+                    pubkey_id=pkid,
+                    assurance_tier=entry.get("assurance_tier"),
+                    detail=f"key compromised at {compromise_suspected}; "
+                    f"deposit signed before ({row_timestamp}) — cryptographic if human role",
+                )
+
+            # Signature valid but within compromise window
+            role = entry.get("role")
+            advisory_marker = " (advisory; node/agent key, timestamp self-asserted)" if role in ("node", "agent") else " (cryptographic; human key, anchor-chained)"
+            return VerificationResult(
+                status="suspect",
+                verified=False,
+                pubkey_id=pkid,
+                assurance_tier=entry.get("assurance_tier"),
+                detail=f"key compromised at {compromise_suspected}; "
+                f"deposit signed after ({row_timestamp}) — within suspect window{advisory_marker}",
+            )
+
+        # Revoked but reason is unknown/missing
         return VerificationResult(
-            status="invalid",
+            status="revoked_key",
             verified=False,
             pubkey_id=pkid,
-            detail="signature does not verify against registered pubkey",
+            assurance_tier=entry.get("assurance_tier"),
+            detail=f"key revoked but reason is missing",
         )
+
     except Exception as exc:
         return VerificationResult(
             status="invalid",
