@@ -395,6 +395,31 @@ class AttributionLog:
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) AS n FROM deposits").fetchone()["n"]
 
+    def get_by_pubkey(
+        self, pubkey_id: str, *, verify: bool = False, registry: "PubkeyRegistry | None" = None
+    ) -> dict | None:
+        """Return the first deposit row for a pubkey_id, or None.
+
+        Used by the settler to cross-check that a pubkey_id exists in the attribution DB
+        before settling (ensures the key is known, even if attribution is incomplete).
+
+        Returns the most recent deposit by this key (verify=False by default for performance;
+        the settler doesn't need signature re-check, just existence).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM deposits WHERE pubkey_id = ? ORDER BY recorded_at DESC LIMIT 1",
+                (pubkey_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        if verify:
+            vr = verify_row(d, registry=registry)
+            d["verified"] = vr.verified
+            d["verification_status"] = vr.status
+        return d
+
 
 # ---------------------------------------------------------------------------
 # Verify-on-read
