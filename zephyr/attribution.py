@@ -298,6 +298,7 @@ class AttributionLog:
 
         # Step 5: Store
         now = datetime.now(timezone.utc).isoformat()
+        newly_recorded = False
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO deposits "
@@ -321,7 +322,13 @@ class AttributionLog:
                 ),
             )
             self._conn.commit()
-            return cur.rowcount > 0
+            newly_recorded = cur.rowcount > 0
+
+        # Emit settlement intent if newly recorded and signed
+        if newly_recorded and signature and pkid:
+            _emit_settlement_intent(provenance)
+
+        return newly_recorded
 
     # -- read / introspection (human-readable surface feeds; not agent-as-dest) --
 
@@ -633,3 +640,94 @@ def get_recorder() -> AttributionLog:
             if _RECORDER is None:
                 _RECORDER = AttributionLog()
     return _RECORDER
+
+
+# ---------------------------------------------------------------------------
+# Settlement intent emitter singleton + factory
+# ---------------------------------------------------------------------------
+
+_EMITTER: callable | None = None
+_EMITTER_LOCK = threading.Lock()
+
+
+def set_emitter(emitter: callable) -> None:
+    """Set the settlement intent emitter callable for testing."""
+    global _EMITTER
+    with _EMITTER_LOCK:
+        _EMITTER = emitter
+
+
+def get_emitter() -> callable | None:
+    """Return the configured settlement intent emitter, or None if unconfigured.
+
+    The emitter is loaded from ZEPHYR_DEPOSIT_EVENT_EMITTER=<module>:<callable>.
+    If unconfigured, returns None and no intents are emitted.
+
+    The emitter callable receives (provenance: dict) -> None and must not raise
+    exceptions that propagate to record(). Any exception is caught and logged."""
+    global _EMITTER
+    if _EMITTER is not None:
+        return _EMITTER
+
+    with _EMITTER_LOCK:
+        # Double-check after acquiring lock
+        if _EMITTER is not None:
+            return _EMITTER
+
+        env_spec = os.environ.get("ZEPHYR_DEPOSIT_EVENT_EMITTER")
+        if not env_spec:
+            return None
+
+        # Parse <module>:<callable>
+        try:
+            module_name, func_name = env_spec.rsplit(":", 1)
+            import importlib
+
+            module = importlib.import_module(module_name)
+            emitter = getattr(module, func_name)
+            _EMITTER = emitter
+            return emitter
+        except (ValueError, ImportError, AttributeError) as e:
+            log.error(
+                "Failed to load ZEPHYR_DEPOSIT_EVENT_EMITTER=%r: %s",
+                env_spec,
+                e,
+            )
+            return None
+
+
+def _emit_settlement_intent(provenance: dict) -> None:
+    """Emit a settlement intent after a signed deposit is recorded.
+
+    Fires outside the attribution DB lock. Any exception is caught and logged
+    (never propagates to record() caller). If no emitter is configured, appends
+    to the default intent queue.
+
+    Intended to be called once per newly-recorded signed deposit, from record().
+    """
+    emitter = get_emitter()
+    if emitter is None:
+        # Default behavior: append to the intent queue
+        try:
+            from zephyr.intent_queue import get_queue
+
+            queue = get_queue()
+            manifest_hash = provenance.get("manifest_hash")
+            if manifest_hash:
+                queue.append(manifest_hash, provenance)
+        except Exception as e:
+            log.warning(
+                "Failed to append settlement intent to queue: %s",
+                e,
+                exc_info=True,
+            )
+        return
+
+    try:
+        emitter(provenance)
+    except Exception as e:
+        log.warning(
+            "Settlement intent emitter raised exception (caught, not propagated): %s",
+            e,
+            exc_info=True,
+        )
