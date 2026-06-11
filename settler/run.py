@@ -126,6 +126,10 @@ class Settler:
                     amount,
                     asset_code,
                 )
+
+                # 6. Write settlement info back to provenance (best-effort)
+                self.attr_log.write_settlement_info(manifest_hash, op_payment_id)
+
                 return True
 
             except Exception as e:
