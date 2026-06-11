@@ -20,12 +20,17 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Optional
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+# Add parent dir to path for zephyr imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from zephyr.signing import pubkey_id as compute_pubkey_id
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -68,11 +73,6 @@ def generate_ed25519_key() -> tuple[Ed25519PrivateKey, bytes]:
         format=serialization.PublicFormat.Raw,
     )
     return private_key, public_bytes
-
-
-def compute_pubkey_id(public_key_bytes: bytes) -> str:
-    """Compute content-addressed pubkey_id (matches zephyr.signing.pubkey_id)."""
-    return "ed25519:" + hashlib.sha256(public_key_bytes).hexdigest()[:16]
 
 
 def serialize_private_key(private_key: Ed25519PrivateKey) -> bytes:
@@ -227,7 +227,7 @@ def setup_demo(
         output_env_file.parent.mkdir(parents=True, exist_ok=True)
         with open(output_env_file, "w") as f:
             for key, value in env_vars.items():
-                f.write(f"export {key}={repr(value)}\n")
+                f.write(f"export {key}={shlex.quote(value)}\n")
         log.info("Wrote environment matrix to %s", output_env_file)
 
     return {

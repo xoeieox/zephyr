@@ -9,7 +9,6 @@ DoD:
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -136,7 +135,11 @@ class TestU0FixtureSetup:
 
     def test_source_wallet_in_env(self, tmp_path):
         """Source wallet is configured in environment."""
-        result = setup_demo(num_contributors=2, keys_dir=tmp_path / "keys")
+        result = setup_demo(
+            num_contributors=2,
+            keys_dir=tmp_path / "keys",
+            wallet_map_path=tmp_path / "wallet_map.json",
+        )
 
         env_vars = result["env_vars"]
 
@@ -147,7 +150,11 @@ class TestU0FixtureSetup:
 
     def test_pubkey_id_format(self, tmp_path):
         """PubKey IDs follow content-addressed format (ed25519:<16hex>)."""
-        result = setup_demo(num_contributors=2, keys_dir=tmp_path / "keys")
+        result = setup_demo(
+            num_contributors=2,
+            keys_dir=tmp_path / "keys",
+            wallet_map_path=tmp_path / "wallet_map.json",
+        )
 
         for contrib in result["contributors"]:
             pubkey_id = contrib["pubkey_id"]
