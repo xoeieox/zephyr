@@ -420,6 +420,59 @@ class AttributionLog:
             d["verification_status"] = vr.status
         return d
 
+    def write_settlement_info(
+        self, manifest_hash: str, op_payment_id: str, settlement_status: str = "settled"
+    ) -> bool:
+        """Write settlement info back to provenance after Open Payments settlement.
+
+        Best-effort: catches exceptions, logs warnings, returns False on error.
+        Never raises or propagates errors.
+
+        Args:
+            manifest_hash: The deposit's manifest_hash
+            op_payment_id: The resulting Open Payments payment ID
+            settlement_status: Status to write (default: 'settled')
+
+        Returns:
+            True if written successfully, False on error
+        """
+        try:
+            with self._lock:
+                # Read existing row
+                row = self._conn.execute(
+                    "SELECT provenance_json FROM deposits WHERE manifest_hash = ?",
+                    (manifest_hash,),
+                ).fetchone()
+                if row is None:
+                    log.warning(
+                        "write_settlement_info: manifest_hash=%r not found in DB",
+                        manifest_hash,
+                    )
+                    return False
+
+                # Update provenance_json with settlement info
+                prov = json.loads(row["provenance_json"])
+                prov["settlement"] = {
+                    "op_payment_id": op_payment_id,
+                    "status": settlement_status,
+                    "written_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+                # Write back (UPDATE)
+                self._conn.execute(
+                    "UPDATE deposits SET provenance_json = ? WHERE manifest_hash = ?",
+                    (json.dumps(prov, sort_keys=True), manifest_hash),
+                )
+                self._conn.commit()
+            return True
+        except Exception as e:
+            log.warning(
+                "write_settlement_info failed for manifest_hash=%r: %s",
+                manifest_hash,
+                e,
+            )
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Verify-on-read
