@@ -389,7 +389,7 @@ def test_u2_ac7_ledger_record_failed(tmp_ledger):
 # ---------------------------------------------------------------------------
 
 
-def test_u2_ac8_settler_drain_batch(tmp_path, tmp_queue, tmp_attr_log, tmp_wallet_map, tmp_signer, tmp_registry):
+def test_u2_ac8_settler_drain_batch(tmp_path, tmp_queue, tmp_attr_log, tmp_wallet_map, tmp_signer, tmp_ledger):
     """Settler can drain a batch of pending intents."""
     import json
     from datetime import datetime, timezone
@@ -422,6 +422,9 @@ def test_u2_ac8_settler_drain_batch(tmp_path, tmp_queue, tmp_attr_log, tmp_walle
         )
         tmp_attr_log._conn.commit()
 
+    # Add the generated pubkey_id to the wallet map
+    tmp_wallet_map._data[pubkey_id] = "https://wallet.interledger-test.dev/settler-test"
+
     # Add intents to queue
     for i in range(3):
         prov_i = {
@@ -432,14 +435,15 @@ def test_u2_ac8_settler_drain_batch(tmp_path, tmp_queue, tmp_attr_log, tmp_walle
         }
         tmp_queue.append(f"sha256:drain-test-{i}", prov_i)
 
-    # Create settler with mocked OP flow
+    # Create settler with injected instances
     settler = Settler(
         source_wallet="https://wallet.interledger-test.dev/settler",
         max_retries=3,
+        intent_queue=tmp_queue,
+        ledger=tmp_ledger,
+        wallet_map=tmp_wallet_map,
+        attr_log=tmp_attr_log,
     )
-    settler.intent_queue = tmp_queue
-    settler.attr_log = tmp_attr_log
-    settler.wallet_map = tmp_wallet_map
 
     with patch.object(settler, "_execute_op_flow") as mock_op:
         mock_op.return_value = "op-payment-xyz"
@@ -449,6 +453,8 @@ def test_u2_ac8_settler_drain_batch(tmp_path, tmp_queue, tmp_attr_log, tmp_walle
 
         # All 3 should be settled (they have wallet hints via tmp_wallet_map)
         assert count == 3
+        # Verify OP flow was called for all 3 intents
+        assert mock_op.call_count == 3
 
 
 # ---------------------------------------------------------------------------

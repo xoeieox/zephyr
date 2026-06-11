@@ -19,10 +19,7 @@ import logging
 import os
 from typing import Optional
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
+import httpx
 
 from zephyr.attribution import AttributionLog
 from zephyr.intent_queue import get_queue
@@ -31,11 +28,6 @@ from settler.split import get_split_policy
 from settler.wallet_map import get_wallet_map
 from settler.gnap import GNAPClient
 from settler.op_flow import OPClient
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +40,10 @@ class Settler:
         source_wallet: str,
         gnap_endpoint: str = "https://auth.interledger-test.dev",
         max_retries: int = 3,
+        intent_queue=None,
+        ledger=None,
+        wallet_map=None,
+        attr_log=None,
     ):
         """Initialize settler.
 
@@ -55,18 +51,22 @@ class Settler:
             source_wallet: Funded settlement-pool source wallet URL
             gnap_endpoint: Rafiki GNAP endpoint
             max_retries: Max attempts per intent before marking failed
+            intent_queue: Optional IntentQueue instance (for testing)
+            ledger: Optional SettlementLedger instance (for testing)
+            wallet_map: Optional WalletMap instance (for testing)
+            attr_log: Optional AttributionLog instance (for testing)
         """
         self.source_wallet = source_wallet
         self.gnap_endpoint = gnap_endpoint
         self.max_retries = max_retries
-        self.intent_queue = get_queue()
-        self.ledger = get_ledger()
-        self.wallet_map = get_wallet_map()
+        self.intent_queue = intent_queue if intent_queue is not None else get_queue()
+        self.ledger = ledger if ledger is not None else get_ledger()
+        self.wallet_map = wallet_map if wallet_map is not None else get_wallet_map()
         self.split_policy = get_split_policy()
-        self.attr_log = AttributionLog()
+        self.attr_log = attr_log if attr_log is not None else AttributionLog()
 
     def settle_one(self, intent: dict) -> bool:
-        """Attempt to settle a single intent.
+        """Attempt to settle a single intent, with retry logic.
 
         Returns True if settled/no-route, False if failed (can retry).
         """
@@ -101,42 +101,52 @@ class Settler:
         # 3. Apply void SplitPolicy
         intent = self.split_policy.compute(intent)
 
-        # 4. Execute OP flow
-        try:
-            op_payment_id = self._execute_op_flow(
-                recipient_wallet,
-                amount,
-                asset_code,
-            )
-            log.info("Settlement succeeded: manifest_hash=%s op_payment_id=%s",
-                     manifest_hash, op_payment_id)
+        # 4. Execute OP flow with retry logic
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                op_payment_id = self._execute_op_flow(
+                    recipient_wallet,
+                    amount,
+                    asset_code,
+                )
+                log.info("Settlement succeeded: manifest_hash=%s op_payment_id=%s",
+                         manifest_hash, op_payment_id)
 
-            # 5. Record in ledger and mark settled
-            self.intent_queue.settle(
-                manifest_hash,
-                op_payment_id=op_payment_id,
-                worker_id="settler-v0",
-            )
-            self.ledger.record_settled(
-                manifest_hash,
-                pubkey_id,
-                op_payment_id,
-                amount,
-                asset_code,
-            )
-            return True
+                # 5. Record in ledger and mark settled
+                self.intent_queue.settle(
+                    manifest_hash,
+                    op_payment_id=op_payment_id,
+                    worker_id="settler-v0",
+                )
+                self.ledger.record_settled(
+                    manifest_hash,
+                    pubkey_id,
+                    op_payment_id,
+                    amount,
+                    asset_code,
+                )
+                return True
 
-        except Exception as e:
-            log.error("Settlement failed for %s: %s", manifest_hash, e, exc_info=True)
-            self.intent_queue.mark_failed(manifest_hash, worker_id="settler-v0")
-            self.ledger.record_failed(
-                manifest_hash,
-                pubkey_id,
-                amount,
-                asset_code,
-                str(e),
-            )
-            return False
+            except Exception as e:
+                last_error = e
+                log.warning("Settlement attempt %d/%d failed for %s: %s",
+                           attempt, self.max_retries, manifest_hash, e)
+                if attempt < self.max_retries:
+                    log.info("Retrying settlement for %s", manifest_hash)
+                    continue
+
+        log.error("Settlement failed after %d attempts for %s: %s",
+                 self.max_retries, manifest_hash, last_error, exc_info=True)
+        self.intent_queue.mark_failed(manifest_hash, worker_id="settler-v0")
+        self.ledger.record_failed(
+            manifest_hash,
+            pubkey_id,
+            amount,
+            asset_code,
+            str(last_error),
+        )
+        return False
 
     def _execute_op_flow(self, recipient_wallet: str, amount: int, asset_code: str) -> str:
         """Execute the full OP flow and return the outgoing payment ID."""
@@ -231,6 +241,11 @@ class Settler:
 
 def main():
     """Entry point for python -m settler.run"""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
     source_wallet = os.environ.get("ZEPHYR_SETTLER_SOURCE_WALLET")
     if not source_wallet:
         raise ValueError("ZEPHYR_SETTLER_SOURCE_WALLET not set")
