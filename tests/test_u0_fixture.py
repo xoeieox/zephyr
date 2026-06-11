@@ -167,7 +167,7 @@ class TestU0FixtureSetup:
 
     def test_multiple_contributors(self, tmp_path):
         """Can generate multiple contributors."""
-        result = setup_demo(num_contributors=5, keys_dir=tmp_path / "keys")
+        result = setup_demo(num_contributors=5, keys_dir=tmp_path / "keys", wallet_map_path=tmp_path / "wallet_map.json")
 
         contributors = result["contributors"]
         assert len(contributors) == 5, "Should create 5 contributors"
