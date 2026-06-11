@@ -224,10 +224,8 @@ def run_demo(
     # Run settler for C (should mark no-route because no wallet)
     log.info("\n--- Phase 4: Settler drains C's intent (expects no-route) ---")
     if dry_run:
-        log.info("DRY RUN: Mocking no-route scenario")
-        with patch.object(settler, "_execute_op_flow") as mock_op:
-            mock_op.return_value = "op-payment-demo-c-5678"
-            settler.drain(limit=10)
+        log.info("DRY RUN: Running settler in dry-run mode")
+        settler.drain(limit=10)
     else:
         settler.drain(limit=10)
 
@@ -259,13 +257,7 @@ def run_demo(
     print()
 
     # Display ledger entries
-    with ledger._write_lock:
-        rows = ledger._write_conn.execute(
-            "SELECT manifest_hash, pubkey_id, op_payment_id, status, amount, "
-            "asset_code, settled_at, created_at "
-            "FROM settlement_ledger "
-            "ORDER BY created_at ASC"
-        ).fetchall()
+    rows = ledger.all()
 
     print(f"{'Contributor':<20} {'Status':<12} {'Amount':<10} {'Attribution':<20}")
     print("-" * 65)

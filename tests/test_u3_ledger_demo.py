@@ -99,13 +99,14 @@ def test_u3_ac2_show_ledger_renders_void_line(tmp_ledger, capsys):
         "USD",
     )
 
-    # Import and call show_ledger
+    # Import and call show_ledger with patched get_ledger
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
-    from scripts.show_ledger import main
+    from scripts import show_ledger
 
-    # Capture output
-    main()
+    # Capture output with patched get_ledger
+    with patch.object(show_ledger, "get_ledger", return_value=tmp_ledger):
+        show_ledger.main()
     captured = capsys.readouterr()
 
     # Check for void-policy line

@@ -128,6 +128,14 @@ class SettlementLedger:
             ).fetchone()
         return dict(row) if row else None
 
+    def all(self) -> list[dict]:
+        """Return all entries in creation order."""
+        with self._write_lock:
+            rows = self._write_conn.execute(
+                "SELECT * FROM settlement_ledger ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def all_settled(self) -> list[dict]:
         """Return all settled entries."""
         with self._write_lock:

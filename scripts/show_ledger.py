@@ -47,13 +47,7 @@ def main():
     print()
 
     # Read all rows in order of creation (not settlement status or amount)
-    with ledger._write_lock:
-        rows = ledger._write_conn.execute(
-            "SELECT manifest_hash, pubkey_id, op_payment_id, status, amount, "
-            "asset_code, settled_at, created_at "
-            "FROM settlement_ledger "
-            "ORDER BY created_at ASC"
-        ).fetchall()
+    rows = ledger.all()
 
     if not rows:
         print("(No settlement records yet)")
