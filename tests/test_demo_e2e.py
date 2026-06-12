@@ -157,8 +157,10 @@ def test_demo_emit_json_schema_valid():
     os.environ["ZEPHYR_ATTRIBUTION_DB"] = str(attr_db)
 
     # Clear any cached modules to force re-evaluation of DEFAULT_*_DIR
+    deleted_modules = {}
     for mod in list(sys.modules.keys()):
         if 'zephyr' in mod or 'fixture' in mod or 'settler' in mod:
+            deleted_modules[mod] = sys.modules[mod]
             del sys.modules[mod]
 
     try:
@@ -291,6 +293,10 @@ def test_demo_emit_json_schema_valid():
         assert "record_not_money" in void, "void_principle missing record_not_money"
         assert "coda" in void, "void_principle missing coda"
     finally:
+        # Restore deleted sys.modules
+        for mod, obj in deleted_modules.items():
+            sys.modules[mod] = obj
+
         # Restore original environment variables
         if old_keys_dir is not None:
             os.environ["ZEPHYR_KEYS_DIR"] = old_keys_dir

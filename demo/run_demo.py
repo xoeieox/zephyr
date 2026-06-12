@@ -345,9 +345,107 @@ def run_demo(
     # Settler processes scene 2
     log.info("\n--- Scene 2 Settlement ---")
     if dry_run:
-        log.info("DRY RUN: Mocking OP flow")
+        log.info("DRY RUN: Mocking OP flow with synthetic events")
         with patch.object(settler, "_execute_op_flow") as mock_op:
             mock_op.return_value = "op-demo-remix-5678"
+
+            # If capturing events, emit synthetic OP/GNAP handshake for scene 2
+            if captured_run:
+                scene_log = captured_run.scene_logs[-1]  # Get scene 2's log
+
+                # Emit synthetic incoming payment request/response
+                scene_log.emit("settler", "rafiki", "op_request", "POST /incoming-payments", {
+                    "method": "POST",
+                    "url": f"{wallet_map.resolve(pubkey_id_remix)}/incoming-payments",
+                    "body": {
+                        "incomingAmount": {
+                            "value": "1",
+                            "assetCode": "USD",
+                            "assetScale": 2,
+                        }
+                    }
+                }, t=1900)
+
+                scene_log.emit("rafiki", "settler", "op_response", "201 incoming payment", {
+                    "status": 201,
+                    "body": {
+                        "id": "https://wallet.interledger-test.dev/incoming-payments/ip_synthetic",
+                        "walletAddress": wallet_map.resolve(pubkey_id_remix),
+                    }
+                }, t=2300)
+
+                # Emit synthetic quote request/response
+                scene_log.emit("settler", "rafiki", "op_request", "POST /quotes", {
+                    "method": "POST",
+                    "url": f"{demo_env['ZEPHYR_SETTLER_SOURCE_WALLET']}/quotes",
+                    "body": {
+                        "receiver": "ip_synthetic",
+                        "method": "ilp",
+                    }
+                }, t=2700)
+
+                scene_log.emit("rafiki", "settler", "op_response", "201 quote", {
+                    "status": 201,
+                    "body": {
+                        "id": "qt_synthetic",
+                        "sendAmount": {"value": "1", "assetCode": "USD", "assetScale": 2},
+                        "receiveAmount": {"value": "1", "assetCode": "USD", "assetScale": 2},
+                    }
+                }, t=3100)
+
+                # Emit synthetic GNAP grant request/response with interact
+                scene_log.emit("settler", "rafiki", "grant_request", "POST /grant (GNAP)", {
+                    "method": "POST",
+                    "url": "https://auth.interledger-test.dev/",
+                    "body": {
+                        "access_token": {
+                            "access": [{"type": "outgoing-payment", "actions": ["create", "read"]}]
+                        },
+                        "client": "zephyr-settler",
+                    }
+                }, t=3500)
+
+                scene_log.emit("rafiki", "settler", "grant_interaction", "interact required", {
+                    "status": 200,
+                    "interact": {
+                        "redirect": "https://wallet.interledger-test.dev/interact/gr_synthetic/approve",
+                        "finish": "gr_synthetic_finish",
+                    },
+                    "human_note": "outgoing-payment grant needs one-time approval in the wallet UI (real Rafiki returns 200 with an interact block, not 401)",
+                }, t=3900)
+
+                scene_log.emit("contributor", "rafiki", "grant_approval", "human approves grant", {
+                    "approved": True,
+                    "approve_url": "https://wallet.interledger-test.dev/interact/gr_synthetic/approve",
+                    "note": "captured once; demonstrates the Open Payments consent model",
+                }, t=4400)
+
+                scene_log.emit("rafiki", "settler", "grant_response", "access_token granted", {
+                    "status": 200,
+                    "body": {
+                        "access_token": {
+                            "value": "gr_synthetic…",
+                            "manage": "https://auth.interledger-test.dev/token/…",
+                        }
+                    }
+                }, t=4900)
+
+                # Emit synthetic outgoing payment request/response
+                scene_log.emit("settler", "rafiki", "op_request", "POST /outgoing-payments", {
+                    "method": "POST",
+                    "url": f"{demo_env['ZEPHYR_SETTLER_SOURCE_WALLET']}/outgoing-payments",
+                    "body": {"quoteId": "qt_synthetic"}
+                }, t=5300)
+
+                scene_log.emit("rafiki", "settler", "op_response", "201 state: completed", {
+                    "status": 201,
+                    "body": {
+                        "id": "op-demo-remix-5678",
+                        "state": "COMPLETED",
+                        "sentAmount": {"value": "1", "assetCode": "USD", "assetScale": 2},
+                    }
+                }, t=5700)
+
             settler.drain(limit=10)
     else:
         log.info("Running settler for remix (may require approval)")
@@ -412,7 +510,7 @@ def run_demo(
     for row in rows:
         pubkey_id = row["pubkey_id"][:18]
         status = row["status"]
-        amount_str = f"${row['amount'] / 100:.2f}" if row["amount"] else "—"
+        amount_str = "—" if status == "no-route" or not row["amount"] else f"${row['amount'] / 100:.2f}"
         contrib_name = "unknown"
         for c in contributors:
             if c["pubkey_id"] == row["pubkey_id"]:
