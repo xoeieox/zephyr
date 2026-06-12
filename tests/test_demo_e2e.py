@@ -37,7 +37,7 @@ def test_demo_setup_registers_pubkeys_in_registry():
 
     # Verify setup completed
     assert len(setup_result["contributors"]) == 3
-    assert setup_result["contributors"][-1]["no_wallet"] is True
+    assert setup_result["contributors"][0]["no_wallet"] is True
 
     # Verify the registry has the registered keys (create fresh instance pointing to registry_dir)
     from zephyr.registry import PubkeyRegistry

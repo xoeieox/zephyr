@@ -54,7 +54,6 @@ class OPClient:
         url = f"{wallet_url.rstrip('/')}/incoming-payments"
         headers = {"Authorization": f"Bearer {token}"}
         req = {
-            "walletAddress": wallet_url,
             "incomingAmount": {
                 "value": "1",
                 "assetCode": "USD",
@@ -99,9 +98,8 @@ class OPClient:
         url = f"{wallet_url.rstrip('/')}/quotes"
         headers = {"Authorization": f"Bearer {token}"}
         req = {
-            "walletAddress": wallet_url,
-            "incomingPaymentId": incoming_payment_id,
-            "sendAmount": send_amount,
+            "receiver": incoming_payment_id,
+            "method": "ilp",
         }
 
         log.debug("POST %s (request quote)", url)
@@ -121,18 +119,14 @@ class OPClient:
         self,
         wallet_url: str,
         token: str,
-        receive_amount: dict,
-        ilp_address: str,
-        ilp_packet: str,
+        quote_id: str,
     ) -> dict:
         """Create an outgoing payment from the source wallet.
 
         Args:
             wallet_url: Source wallet URL (settler's wallet)
             token: Bearer token
-            receive_amount: Amount recipient will receive
-            ilp_address: ILP address from quote
-            ilp_packet: ILP packet from quote
+            quote_id: ID of the quote from request_quote
 
         Returns:
             Outgoing payment dict with:
@@ -142,10 +136,7 @@ class OPClient:
         url = f"{wallet_url.rstrip('/')}/outgoing-payments"
         headers = {"Authorization": f"Bearer {token}"}
         req = {
-            "walletAddress": wallet_url,
-            "receiveAmount": receive_amount,
-            "ilpAddress": ilp_address,
-            "ilpPacket": ilp_packet,
+            "quoteId": quote_id,
         }
 
         log.debug("POST %s (create outgoing payment)", url)

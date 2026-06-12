@@ -205,9 +205,7 @@ def test_u2_ac2_op_client_create_outgoing_payment():
         result = op.create_outgoing_payment(
             "https://wallet.interledger-test.dev/settler",
             "test-bearer-token",
-            receive_amount={"value": "1", "assetCode": "USD", "assetScale": 2},
-            ilp_address="g.rafiki.alice",
-            ilp_packet="packet-data-here",
+            quote_id="quote-123",
         )
 
         assert result["id"] == "outgoing-payment-456"

@@ -66,6 +66,7 @@ CREATE INDEX IF NOT EXISTS deposits_store    ON deposits(store_kind);
 _MIGRATION_COLS = [
     ("signature", "TEXT"),
     ("pubkey_id", "TEXT"),
+    ("derived_from", "TEXT"),
 ]
 _MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS deposits_pubkey ON deposits(pubkey_id);
@@ -304,8 +305,8 @@ class AttributionLog:
                 "INSERT OR IGNORE INTO deposits "
                 "(manifest_hash, agent_id, tool, model, timestamp, store_kind, "
                 " target_key, schema_version, provenance_json, recorded_at, "
-                " signature, pubkey_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " signature, pubkey_id, derived_from) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     mh,
                     provenance.get("agent_id"),
@@ -319,6 +320,7 @@ class AttributionLog:
                     now,
                     signature,
                     pkid,
+                    provenance.get("derived_from"),
                 ),
             )
             self._conn.commit()
