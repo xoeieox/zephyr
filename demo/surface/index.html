@@ -1,0 +1,1019 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zephyr Demo - Three-Pane Protocol Theater</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --color-bg: #0f0f0f;
+            --color-text: #e0e0e0;
+            --color-text-muted: #888;
+            --color-pane-bg: #1a1a1a;
+            --color-pane-border: #333;
+            --color-contributor: #4a9eff;
+            --color-settler: #7cb342;
+            --color-rafiki: #ff6b6b;
+            --color-packet: #ffd700;
+            --color-success: #4caf50;
+            --color-void: #9c27b0;
+            --font-mono: 'Monaco', 'Menlo', 'Courier New', monospace;
+            --font-size-mono: 12px;
+            --font-size-label: 14px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            * {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+
+        body {
+            background: var(--color-bg);
+            color: var(--color-text);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .header {
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .title {
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        .provenance-badge {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            padding: 6px 12px;
+            background: var(--color-pane-bg);
+            border: 1px solid var(--color-pane-border);
+            border-radius: 4px;
+            color: var(--color-text-muted);
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .control-group {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        button {
+            padding: 8px 16px;
+            background: var(--color-pane-border);
+            color: var(--color-text);
+            border: 1px solid var(--color-pane-border);
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: var(--color-settler);
+        }
+
+        button:active {
+            opacity: 0.7;
+        }
+
+        .speed-buttons {
+            display: flex;
+            gap: 4px;
+        }
+
+        .speed-buttons button {
+            padding: 6px 12px;
+            font-size: 11px;
+        }
+
+        .speed-buttons button.active {
+            background: var(--color-settler);
+            border-color: var(--color-settler);
+        }
+
+        .timeline-bar {
+            height: 20px;
+            background: var(--color-pane-bg);
+            border: 1px solid var(--color-pane-border);
+            border-radius: 4px;
+            flex: 1;
+            min-width: 200px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .timeline-progress {
+            height: 100%;
+            background: linear-gradient(to right, var(--color-settler), var(--color-contributor));
+            width: 0%;
+            transition: width 0.1s linear;
+        }
+
+        .scene-label {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--color-text-muted);
+            padding: 2px 6px;
+        }
+
+        .panes-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 20px;
+            position: relative;
+        }
+
+        @media (max-width: 1600px) {
+            .panes-container {
+                grid-template-columns: 1fr 1fr;
+                gap: 12px;
+            }
+        }
+
+        @media (max-width: 1024px) {
+            .panes-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .pane {
+            background: var(--color-pane-bg);
+            border: 2px solid var(--color-pane-border);
+            border-radius: 6px;
+            padding: 16px;
+            min-height: 400px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .pane.active {
+            border-color: currentColor;
+        }
+
+        .pane.contributor.active {
+            border-color: var(--color-contributor);
+        }
+
+        .pane.settler.active {
+            border-color: var(--color-settler);
+        }
+
+        .pane.rafiki.active {
+            border-color: var(--color-rafiki);
+        }
+
+        .pane-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--color-pane-border);
+        }
+
+        .pane-title {
+            font-size: var(--font-size-label);
+            font-weight: bold;
+            flex: 1;
+        }
+
+        .pane-status {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            padding: 4px 8px;
+            background: var(--color-pane-border);
+            border-radius: 3px;
+            min-width: 80px;
+            text-align: center;
+        }
+
+        .artifact-display {
+            margin-bottom: 16px;
+            text-align: center;
+        }
+
+        .artifact-display img,
+        .artifact-display svg {
+            max-width: 100%;
+            max-height: 200px;
+            border-radius: 4px;
+            border: 1px solid var(--color-pane-border);
+        }
+
+        .artifact-label {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            color: var(--color-text-muted);
+            margin-top: 8px;
+        }
+
+        .void-banner {
+            background: var(--color-void);
+            color: white;
+            padding: 12px;
+            border-radius: 4px;
+            margin-bottom: 12px;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        .lineage-tree {
+            margin-bottom: 16px;
+            padding: 12px;
+            background: rgba(156, 39, 176, 0.1);
+            border: 1px solid var(--color-void);
+            border-radius: 4px;
+        }
+
+        .lineage-tree svg {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .pane-log {
+            flex: 1;
+            overflow-y: auto;
+            font-family: var(--font-mono);
+            font-size: var(--font-size-mono);
+            background: var(--color-bg);
+            padding: 12px;
+            border: 1px solid var(--color-pane-border);
+            border-radius: 4px;
+        }
+
+        .log-line {
+            margin-bottom: 4px;
+            padding: 4px 6px;
+            border-left: 2px solid transparent;
+            transition: border-color 0.2s;
+        }
+
+        .log-line.entering {
+            border-left-color: var(--color-packet);
+            animation: highlightFade 0.5s ease-out;
+        }
+
+        @keyframes highlightFade {
+            0% {
+                background: rgba(255, 215, 0, 0.2);
+            }
+            100% {
+                background: transparent;
+            }
+        }
+
+        .log-label {
+            color: var(--color-text-muted);
+            font-weight: bold;
+        }
+
+        .log-content {
+            color: var(--color-text);
+            word-break: break-word;
+            white-space: pre-wrap;
+        }
+
+        .packet-animation {
+            position: absolute;
+            pointer-events: none;
+            z-index: 100;
+        }
+
+        .packet {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: var(--color-packet);
+            box-shadow: 0 0 12px var(--color-packet);
+            animation: float 0.6s ease-in-out forwards;
+        }
+
+        @keyframes float {
+            0% {
+                opacity: 1;
+            }
+            100% {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+        }
+
+        .ledger-section {
+            margin-top: 20px;
+            padding: 16px;
+            background: var(--color-pane-bg);
+            border: 2px solid var(--color-void);
+            border-radius: 6px;
+        }
+
+        .ledger-title {
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 12px;
+            color: var(--color-void);
+        }
+
+        .ledger-row {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--color-pane-border);
+            margin-bottom: 4px;
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr 1fr;
+            gap: 12px;
+        }
+
+        .ledger-row:last-child {
+            border-bottom: none;
+        }
+
+        .ledger-row.void-line {
+            background: rgba(156, 39, 176, 0.1);
+            border-left: 3px solid var(--color-void);
+            padding-left: 10px;
+            font-weight: bold;
+        }
+
+        .ledger-row.coda {
+            background: rgba(156, 39, 176, 0.05);
+            border-left: 3px solid var(--color-void);
+            padding-left: 10px;
+            font-style: italic;
+            grid-column: 1 / -1;
+            margin-top: 8px;
+        }
+
+        .record-stands {
+            color: var(--color-text-muted);
+            font-style: italic;
+        }
+
+        .status-settled {
+            color: var(--color-success);
+            font-weight: bold;
+        }
+
+        .status-no-route {
+            color: var(--color-rafiki);
+        }
+
+        .empty-state {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--color-text-muted);
+            font-family: var(--font-mono);
+            font-size: 12px;
+            text-align: center;
+        }
+
+        .grant-approval-highlight {
+            animation: approvalPulse 1.5s ease-in-out;
+        }
+
+        @keyframes approvalPulse {
+            0% {
+                background: rgba(76, 175, 80, 0.2);
+                border-color: var(--color-success);
+            }
+            50% {
+                background: rgba(76, 175, 80, 0.1);
+                border-color: var(--color-success);
+            }
+            100% {
+                background: transparent;
+                border-color: var(--color-pane-border);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">Zephyr Demo — Protocol Theater</div>
+        <div class="provenance-badge" id="provenance-badge">loading...</div>
+    </div>
+
+    <div class="controls">
+        <div class="control-group">
+            <button id="play-btn">⏵ Play</button>
+            <button id="pause-btn">⏸ Pause</button>
+            <button id="restart-btn">⟲ Restart</button>
+        </div>
+        <div class="control-group">
+            <label for="speed-control" style="font-size: 12px; color: var(--color-text-muted);">Speed:</label>
+            <div class="speed-buttons">
+                <button class="speed-btn" data-speed="0.5">0.5×</button>
+                <button class="speed-btn active" data-speed="1">1×</button>
+                <button class="speed-btn" data-speed="2">2×</button>
+            </div>
+        </div>
+        <div class="timeline-bar">
+            <div class="timeline-progress" id="timeline-progress"></div>
+        </div>
+    </div>
+
+    <div class="scene-label" id="scene-label"></div>
+
+    <div class="panes-container" id="panes-container">
+        <div class="pane contributor">
+            <div class="pane-header">
+                <div class="pane-title">Contributor</div>
+                <div class="pane-status" id="contributor-status">—</div>
+            </div>
+            <div class="artifact-display" id="contributor-artifact"></div>
+            <div class="lineage-tree" id="lineage-tree" style="display: none;"></div>
+            <div class="pane-log" id="contributor-log"></div>
+        </div>
+
+        <div class="pane settler">
+            <div class="pane-header">
+                <div class="pane-title">Settler (Zephyr)</div>
+                <div class="pane-status" id="settler-status">—</div>
+            </div>
+            <div id="settler-content">
+                <div class="void-banner" id="void-banner" style="display: none;">VOID — no claim on the correct share</div>
+                <div class="pane-log" id="settler-log"></div>
+            </div>
+        </div>
+
+        <div class="pane rafiki">
+            <div class="pane-header">
+                <div class="pane-title">Rafiki · Open Payments</div>
+                <div class="pane-status" id="rafiki-status">—</div>
+            </div>
+            <div class="empty-state" id="rafiki-empty">not called (no wallet)</div>
+            <div class="pane-log" id="rafiki-log"></div>
+        </div>
+    </div>
+
+    <div class="ledger-section">
+        <div class="ledger-title">Ledger</div>
+        <div id="ledger-rows"></div>
+        <div class="ledger-row void-line" id="void-line"></div>
+        <div class="ledger-row coda" id="coda"></div>
+    </div>
+
+    <script>
+        // ============ State & Configuration ============
+
+        let fixture = null;
+        let currentScene = 0;
+        let currentEventIndex = 0;
+        let isPlaying = false;
+        let playbackSpeed = 1;
+        let sceneStartTime = 0;
+        let totalDuration = 0;
+        let packetAnimationIds = [];
+        let eventQueue = [];
+        let lastEventTime = 0;
+        let visibleLedgerRows = [];
+
+        const panes = {
+            contributor: { element: document.querySelector('.pane.contributor'), logElement: document.getElementById('contributor-log'), status: document.getElementById('contributor-status') },
+            settler: { element: document.querySelector('.pane.settler'), logElement: document.getElementById('settler-log'), status: document.getElementById('settler-status') },
+            rafiki: { element: document.querySelector('.pane.rafiki'), logElement: document.getElementById('rafiki-log'), status: document.getElementById('rafiki-status') }
+        };
+
+        // ============ Fixture Loading ============
+
+        async function loadFixture() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const runParam = urlParams.get('run');
+
+            try {
+                if (runParam) {
+                    // Load external event-log
+                    const response = await fetch(runParam);
+                    if (!response.ok) throw new Error(`Failed to load ${runParam}: ${response.status}`);
+                    fixture = await response.json();
+                } else {
+                    // Use inlined fixture
+                    fixture = await getInlinedFixture();
+                }
+                initializeUI();
+            } catch (error) {
+                console.error('Failed to load fixture:', error);
+                document.body.innerHTML = `<div style="color: red; padding: 20px;">Error loading fixture: ${error.message}</div>`;
+            }
+        }
+
+        async function getInlinedFixture() {
+            // Inlined fixture for no-server demo
+            return {
+                "schema_version": "1.1",
+                "run": {
+                    "id": "run-EXAMPLE",
+                    "mode": "live-testnet-a1",
+                    "network": "interledger-test.dev",
+                    "captured_at": "2026-06-12T20:00:00Z",
+                    "settler_source_wallet": "https://wallet.interledger-test.dev/zephyr-settler-source",
+                    "note": "Captured run of demo/run_demo.py --emit-json, replayed by the HTML surface.",
+                    "inter_scene_gap_ms": 2000
+                },
+                "actors": [
+                    { "id": "contributor", "label": "Contributor", "kind": "entity", "sub": "the human/agent who made the work" },
+                    { "id": "settler", "label": "Settler", "kind": "entity", "sub": "Zephyr" },
+                    { "id": "rafiki", "label": "Rafiki", "kind": "responder", "sub": "Open Payments · interledger-test.dev" }
+                ],
+                "artifacts": [
+                    { "id": "smiley", "filename": "assets/smiley.png", "media_type": "image/png", "manifest_hash": "sha256:A1B2C3D4E5F6", "caption": "original — a smiley face" },
+                    { "id": "hat-remix", "filename": "assets/smiley-hat.png", "media_type": "image/png", "manifest_hash": "sha256:B7C8D9E0F1A2", "derived_from": "sha256:A1B2C3D4E5F6", "caption": "remix — the smiley, now with a hat" }
+                ],
+                "scenes": [
+                    {
+                        "id": "scene-1-original-no-wallet",
+                        "title": "An original, with no wallet",
+                        "contributor": { "agent_id": "agent:contributor_01", "display": "contributor_01", "has_wallet": false },
+                        "artifact": "smiley",
+                        "outcome": "no-route",
+                        "events": [
+                            { "t": 0, "from": "contributor", "to": "settler", "kind": "deposit", "label": "signs the smiley", "detail": { "artifact": "smiley", "manifest_hash": "sha256:A1B2C3D4E5F6", "signature": "ed25519:7f3a…", "pubkey_id": "ed25519:bb7fd0d38a06b469", "note": "Zephyr records the hash, never the image bytes" } },
+                            { "t": 500, "from": "settler", "to": "settler", "kind": "route", "label": "resolve wallet ✗", "detail": { "resolved": false, "reason": "no wallet linked for this pubkey" } },
+                            { "t": 1000, "from": "settler", "to": "settler", "kind": "ledger", "label": "record no-route", "detail": { "status": "no-route", "amount": null, "asset_code": "USD", "attribution": "fully credited", "record": "permanent, portable, undiminished — the record stands", "emphasis": "Rafiki is never called. No wallet, no payment — and no deferred/backfilled payment is promised. Attribution does not depend on payment." } }
+                        ]
+                    },
+                    {
+                        "id": "scene-2-remix-settles",
+                        "title": "A remix that builds on it, with a wallet",
+                        "contributor": { "agent_id": "agent:contributor_02", "display": "contributor_02", "has_wallet": true },
+                        "artifact": "hat-remix",
+                        "outcome": "settled",
+                        "events": [
+                            { "t": 0, "from": "contributor", "to": "settler", "kind": "deposit", "label": "signs the remix", "detail": { "artifact": "hat-remix", "manifest_hash": "sha256:B7C8D9E0F1A2", "derived_from": "sha256:A1B2C3D4E5F6", "signature": "ed25519:9c2e…", "pubkey_id": "ed25519:df92f9e7566838ac", "note": "signed derived_from claim — attribution travels with the work" } },
+                            { "t": 500, "from": "settler", "to": "settler", "kind": "lineage", "label": "attribution travels", "detail": { "derived_from": "sha256:A1B2C3D4E5F6", "from_contributor": "contributor_01", "note": "contributor_01 is now credited inside this remix's lineage" } },
+                            { "t": 1000, "from": "settler", "to": "settler", "kind": "policy", "label": "void SplitPolicy", "detail": { "policy": "VOID", "asserts": "no claim on the correct share between original and remix" } },
+                            { "t": 1500, "from": "settler", "to": "settler", "kind": "route", "label": "resolve wallet ✓", "detail": { "resolved": true, "wallet": "https://wallet.interledger-test.dev/contributor_02" } },
+                            { "t": 1900, "from": "settler", "to": "rafiki", "kind": "op_request", "label": "POST /incoming-payments", "detail": { "method": "POST", "url": "https://wallet.interledger-test.dev/contributor_02/incoming-payments", "body": { "incomingAmount": { "value": "1", "assetCode": "USD", "assetScale": 2 } } } },
+                            { "t": 2300, "from": "rafiki", "to": "settler", "kind": "op_response", "label": "201 incoming payment", "detail": { "status": 201, "body": { "id": "https://wallet.interledger-test.dev/incoming-payments/ip_9f3a2b", "walletAddress": "https://wallet.interledger-test.dev/contributor_02" } } },
+                            { "t": 2700, "from": "settler", "to": "rafiki", "kind": "op_request", "label": "POST /quotes", "detail": { "method": "POST", "url": "https://wallet.interledger-test.dev/zephyr-settler-source/quotes", "body": { "receiver": "ip_9f3a2b", "method": "ilp" } } },
+                            { "t": 3100, "from": "rafiki", "to": "settler", "kind": "op_response", "label": "201 quote", "detail": { "status": 201, "body": { "id": "qt_4c7e", "sendAmount": { "value": "1", "assetCode": "USD", "assetScale": 2 }, "receiveAmount": { "value": "1", "assetCode": "USD", "assetScale": 2 } } } },
+                            { "t": 3500, "from": "settler", "to": "rafiki", "kind": "grant_request", "label": "POST /grant (GNAP)", "detail": { "method": "POST", "url": "https://auth.interledger-test.dev/", "body": { "access_token": { "access": [ { "type": "outgoing-payment", "actions": ["create", "read"] } ] }, "client": "zephyr-settler" } } },
+                            { "t": 3900, "from": "rafiki", "to": "settler", "kind": "grant_interaction", "label": "interact required", "detail": { "status": 200, "interact": { "redirect": "https://wallet.interledger-test.dev/interact/gr_a1b2/approve", "finish": "gr_a1b2_finish" }, "human_note": "outgoing-payment grant needs one-time approval in the wallet UI (real Rafiki returns 200 with an interact block, not 401)" } },
+                            { "t": 4400, "from": "contributor", "to": "rafiki", "kind": "grant_approval", "label": "human approves grant", "detail": { "approved": true, "approve_url": "https://wallet.interledger-test.dev/interact/gr_a1b2/approve", "note": "captured once; demonstrates the Open Payments consent model" } },
+                            { "t": 4900, "from": "rafiki", "to": "settler", "kind": "grant_response", "label": "access_token granted", "detail": { "status": 200, "body": { "access_token": { "value": "gr_a1b2…", "manage": "https://auth.interledger-test.dev/token/…" } } } },
+                            { "t": 5300, "from": "settler", "to": "rafiki", "kind": "op_request", "label": "POST /outgoing-payments", "detail": { "method": "POST", "url": "https://wallet.interledger-test.dev/zephyr-settler-source/outgoing-payments", "body": { "quoteId": "qt_4c7e" } } },
+                            { "t": 5700, "from": "rafiki", "to": "settler", "kind": "op_response", "label": "201 state: completed", "detail": { "status": 201, "body": { "id": "op_7e1d", "state": "COMPLETED", "sentAmount": { "value": "1", "assetCode": "USD", "assetScale": 2 } } } },
+                            { "t": 6100, "from": "settler", "to": "settler", "kind": "ledger", "label": "record settled ✓", "detail": { "status": "settled", "amount": 1, "asset_code": "USD", "op_payment_id": "op_7e1d", "attribution": "fully credited" } }
+                        ]
+                    }
+                ],
+                "ledger": [
+                    { "contributor": "contributor_01", "artifact": "smiley", "status": "no-route", "amount": null, "asset_code": "USD", "op_payment_id": null, "attribution": "fully credited", "record": "the record stands" },
+                    { "contributor": "contributor_02", "artifact": "hat-remix", "status": "settled", "amount": 1, "asset_code": "USD", "op_payment_id": "op_7e1d", "attribution": "fully credited", "derived_from": "contributor_01" }
+                ],
+                "void_principle": {
+                    "policy": "VOID",
+                    "statement": "SplitPolicy VOID — this system makes no claim about the correct share between the original and the remix.",
+                    "record_not_money": "No wallet, no payment — and no retroactive backfill. There is no honest way to pay a past settlement later without conjuring money or quietly diverting other collaborators' payments. So Zephyr guarantees the RECORD — permanent, portable, undiminished — never deferred money. Attribution does not depend on payment.",
+                    "coda": "The livelihood gap is the unsolved problem."
+                }
+            };
+        }
+
+        // ============ UI Initialization ============
+
+        function initializeUI() {
+            // Provenance badge
+            document.getElementById('provenance-badge').textContent = fixture.run.mode;
+
+            // Calculate total duration
+            calculateTotalDuration();
+
+            // Setup controls
+            document.getElementById('play-btn').addEventListener('click', play);
+            document.getElementById('pause-btn').addEventListener('click', pause);
+            document.getElementById('restart-btn').addEventListener('click', restart);
+            document.querySelectorAll('.speed-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    document.querySelectorAll('.speed-btn').forEach(b => b.classList.remove('active'));
+                    e.target.classList.add('active');
+                    playbackSpeed = parseFloat(e.target.dataset.speed);
+                });
+            });
+
+            // Load first scene
+            loadScene(0);
+        }
+
+        function calculateTotalDuration() {
+            let maxDuration = 0;
+            fixture.scenes.forEach((scene, sceneIdx) => {
+                if (scene.events.length > 0) {
+                    const lastEvent = scene.events[scene.events.length - 1];
+                    maxDuration = Math.max(maxDuration, lastEvent.t);
+                }
+            });
+            totalDuration = maxDuration;
+        }
+
+        // ============ Scene Loading ============
+
+        function loadScene(sceneIndex) {
+            if (sceneIndex >= fixture.scenes.length) {
+                isPlaying = false;
+                return;
+            }
+
+            currentScene = sceneIndex;
+            currentEventIndex = 0;
+            lastEventTime = 0;
+            eventQueue = [];
+            visibleLedgerRows = [];
+
+            const scene = fixture.scenes[sceneIndex];
+            document.getElementById('scene-label').textContent = `${sceneIndex + 1}. ${scene.title}`;
+
+            // Clear pane logs and status
+            Object.values(panes).forEach(pane => {
+                pane.logElement.innerHTML = '';
+                pane.status.textContent = '—';
+                pane.element.classList.remove('active');
+            });
+
+            // Clear rafiki empty state and void banner
+            document.getElementById('void-banner').style.display = 'none';
+            document.getElementById('rafiki-empty').style.display = 'flex';
+            document.getElementById('lineage-tree').style.display = 'none';
+
+            // Render artifact
+            renderArtifact(scene);
+
+            sceneStartTime = Date.now();
+            lastEventTime = 0;
+        }
+
+        // ============ Artifact & Lineage Rendering ============
+
+        function renderArtifact(scene) {
+            const artifactId = scene.artifact;
+            const artifact = fixture.artifacts.find(a => a.id === artifactId);
+            const container = document.getElementById('contributor-artifact');
+
+            container.innerHTML = '';
+
+            if (!artifact) {
+                container.innerHTML = '<div class="empty-state">Artifact not found</div>';
+                return;
+            }
+
+            // Try to load the image
+            const img = document.createElement('img');
+            img.src = artifact.filename;
+            img.alt = artifact.caption;
+
+            // Fallback to placeholder SVG
+            img.onerror = () => {
+                container.innerHTML = createPlaceholderSVG(artifact.manifest_hash, artifact.caption);
+            };
+
+            img.onload = () => {
+                container.innerHTML = '';
+                container.appendChild(img);
+                const label = document.createElement('div');
+                label.className = 'artifact-label';
+                label.textContent = `${artifact.caption}\n${artifact.manifest_hash}`;
+                container.appendChild(label);
+            };
+
+            // Trigger load
+            container.appendChild(img);
+            if (!img.complete) {
+                // Still loading, add placeholder while waiting
+                if (!img.src || img.src === artifact.filename) {
+                    img.style.display = 'none';
+                }
+            }
+        }
+
+        function createPlaceholderSVG(hash, caption) {
+            const truncatedHash = hash.substring(0, 16);
+            const svg = `
+                <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" style="border: 1px solid #333; border-radius: 4px;">
+                    <rect width="200" height="200" fill="#1a1a1a"/>
+                    <text x="100" y="90" text-anchor="middle" font-size="12" font-family="monospace" fill="#888">
+                        [image]
+                    </text>
+                    <text x="100" y="110" text-anchor="middle" font-size="9" font-family="monospace" fill="#666">
+                        ${truncatedHash}
+                    </text>
+                </svg>
+            `;
+            const label = `<div class="artifact-label">${caption}\n${hash}</div>`;
+            return svg + label;
+        }
+
+        function renderLineage() {
+            const scene = fixture.scenes[1]; // scene-2-remix-settles
+            const artifact = fixture.artifacts.find(a => a.id === scene.artifact);
+
+            if (!artifact || !artifact.derived_from) {
+                return;
+            }
+
+            const originArtifact = fixture.artifacts.find(a => a.manifest_hash === artifact.derived_from);
+            const container = document.getElementById('lineage-tree');
+
+            const svg = createLineageSVG(originArtifact, artifact);
+            container.innerHTML = svg;
+            container.style.display = 'block';
+        }
+
+        function createLineageSVG(originArtifact, remixArtifact) {
+            const nodeSize = 60;
+            const nodeY = 50;
+            const originX = 60;
+            const remixX = 240;
+            const treeHeight = 160;
+
+            // Curved cubic bezier with offset control points for visual arc
+            const cpY1 = nodeY - 30; // Control point above the line
+
+            const svg = `
+                <svg width="100%" height="${treeHeight}" viewBox="0 0 300 160" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+                    <!-- Edge (cubic bezier with curved control points) -->
+                    <path class="edge-path" d="M ${originX + nodeSize / 2} ${nodeY + nodeSize / 2} C ${originX + nodeSize / 2} ${cpY1}, ${remixX - nodeSize / 2} ${cpY1}, ${remixX - nodeSize / 2} ${nodeY + nodeSize / 2}" stroke="#9c27b0" stroke-width="2" fill="none" stroke-dasharray="4,4" opacity="0.6"/>
+
+                    <!-- Origin node -->
+                    <rect class="node-rect" x="${originX}" y="${nodeY}" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#7cb342" stroke-width="2"/>
+                    <text x="${originX + nodeSize / 2}" y="${nodeY + nodeSize / 2 + 5}" text-anchor="middle" font-size="10" font-family="monospace" fill="#7cb342">origin</text>
+                    <text x="${originX + nodeSize / 2}" y="${nodeY + nodeSize / 2 + 18}" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">${originArtifact.manifest_hash.substring(0, 8)}</text>
+
+                    <!-- Remix node -->
+                    <rect class="node-rect" x="${remixX - nodeSize}" y="${nodeY}" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#9c27b0" stroke-width="2"/>
+                    <text x="${remixX - nodeSize / 2}" y="${nodeY + nodeSize / 2 + 5}" text-anchor="middle" font-size="10" font-family="monospace" fill="#9c27b0">remix</text>
+                    <text x="${remixX - nodeSize / 2}" y="${nodeY + nodeSize / 2 + 18}" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">${remixArtifact.manifest_hash.substring(0, 8)}</text>
+
+                    <!-- Edge label -->
+                    <text x="150" y="20" text-anchor="middle" font-size="9" font-family="monospace" fill="#9c27b0">derived_from</text>
+                    <text x="150" y="32" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">signed claim</text>
+                </svg>
+            `;
+            return svg;
+        }
+
+        // ============ Playback Logic ============
+
+        function play() {
+            if (isPlaying) return;
+            isPlaying = true;
+            scheduleNextEvent();
+        }
+
+        function pause() {
+            isPlaying = false;
+            packetAnimationIds.forEach(id => cancelAnimationFrame(id));
+            packetAnimationIds = [];
+        }
+
+        function restart() {
+            pause();
+            currentScene = 0;
+            currentEventIndex = 0;
+            loadScene(0);
+            updateTimeline();
+        }
+
+        function scheduleNextEvent() {
+            if (!isPlaying) return;
+
+            const scene = fixture.scenes[currentScene];
+            if (!scene || currentEventIndex >= scene.events.length) {
+                // Scene complete - move to next or end
+                if (currentScene < fixture.scenes.length - 1) {
+                    // Wait inter_scene_gap_ms before next scene
+                    setTimeout(() => {
+                        if (isPlaying) {
+                            loadScene(currentScene + 1);
+                            play();
+                        }
+                    }, fixture.run.inter_scene_gap_ms);
+                } else {
+                    isPlaying = false;
+                }
+                return;
+            }
+
+            const event = scene.events[currentEventIndex];
+            const eventTime = event.t;
+            const timeSinceSceneStart = Date.now() - sceneStartTime;
+            const adjustedEventTime = eventTime / playbackSpeed;
+            const delay = Math.max(0, adjustedEventTime - timeSinceSceneStart);
+
+            setTimeout(() => {
+                if (isPlaying) {
+                    processEvent(event);
+                    currentEventIndex++;
+                    scheduleNextEvent();
+                }
+            }, delay);
+        }
+
+        function processEvent(event) {
+            const scene = fixture.scenes[currentScene];
+            lastEventTime = Math.max(lastEventTime, event.t);
+            updateTimeline();
+
+            // Mark panes as active
+            if (event.from) {
+                panes[event.from].element.classList.add('active');
+            }
+            if (event.to && event.to !== event.from) {
+                panes[event.to].element.classList.add('active');
+            }
+
+            // Handle special event kinds
+            if (event.kind === 'policy') {
+                document.getElementById('void-banner').style.display = 'block';
+            }
+
+            if (event.kind === 'lineage') {
+                renderLineage();
+                document.getElementById('lineage-tree').style.display = 'block';
+            }
+
+            if (event.kind === 'ledger') {
+                // Add corresponding ledger row (scene 0 -> row 0, scene 1 -> row 1)
+                visibleLedgerRows.push(currentScene);
+                updateLedgerDisplay();
+            }
+
+            if (event.kind === 'grant_approval') {
+                // Apply consent-beat visual highlight to contributor pane
+                const contributorPane = panes.contributor.element;
+                contributorPane.classList.add('grant-approval-highlight');
+                // Remove highlight after animation completes
+                setTimeout(() => {
+                    contributorPane.classList.remove('grant-approval-highlight');
+                }, 1500);
+            }
+
+            // Log the event
+            logEvent(event);
+
+            // Animate packet between panes if inter-pane
+            if (event.from && event.to && event.from !== event.to) {
+                animatePacket(event.from, event.to);
+            }
+
+            // Update status
+            updatePaneStatus(event);
+
+            // Hide rafiki empty state if any event
+            if (event.to === 'rafiki' || event.from === 'rafiki') {
+                document.getElementById('rafiki-empty').style.display = 'none';
+            }
+        }
+
+        function logEvent(event) {
+            const targetPane = event.from || event.to;
+            if (!panes[targetPane]) return;
+
+            const logContainer = panes[targetPane].logElement;
+            const line = document.createElement('div');
+            line.className = 'log-line entering';
+            line.innerHTML = `
+                <span class="log-label">[${event.label}]</span>
+                <span class="log-content">${JSON.stringify(event.detail, null, 2)}</span>
+            `;
+            logContainer.appendChild(line);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        function updatePaneStatus(event) {
+            const pane = event.to || event.from;
+            if (!panes[pane]) return;
+
+            if (event.kind === 'route') {
+                panes[pane].status.textContent = event.detail.resolved ? '✓' : '✗';
+            } else if (event.kind === 'ledger') {
+                panes[pane].status.textContent = event.detail.status === 'settled' ? 'settled' : 'no-route';
+            } else if (event.kind === 'grant_approval') {
+                panes[pane].status.textContent = 'approved';
+            }
+        }
+
+        function animatePacket(fromActor, toActor) {
+            const fromPane = panes[fromActor];
+            const toPane = panes[toActor];
+
+            if (!fromPane || !toPane) return;
+
+            const fromRect = fromPane.element.getBoundingClientRect();
+            const toRect = toPane.element.getBoundingClientRect();
+
+            const packet = document.createElement('div');
+            packet.className = 'packet-animation';
+            packet.innerHTML = '<div class="packet"></div>';
+            document.body.appendChild(packet);
+
+            const startX = fromRect.left + fromRect.width / 2;
+            const startY = fromRect.top + fromRect.height / 2;
+            const endX = toRect.left + toRect.width / 2;
+            const endY = toRect.top + toRect.height / 2;
+
+            const duration = 600;
+            const startTime = Date.now();
+            let frameId = null;
+
+            function animateFrame() {
+                const elapsed = Date.now() - startTime;
+                const progress = Math.min(elapsed / duration, 1);
+
+                packet.style.left = (startX + (endX - startX) * progress) + 'px';
+                packet.style.top = (startY + (endY - startY) * progress) + 'px';
+
+                if (progress < 1) {
+                    frameId = requestAnimationFrame(animateFrame);
+                    packetAnimationIds.push(frameId);
+                } else {
+                    packet.remove();
+                    const idx = packetAnimationIds.indexOf(frameId);
+                    if (idx > -1) packetAnimationIds.splice(idx, 1);
+                }
+            }
+
+            frameId = requestAnimationFrame(animateFrame);
+            packetAnimationIds.push(frameId);
+        }
+
+        function updateTimeline() {
+            const scene = fixture.scenes[currentScene];
+            let maxTime = scene.events.length > 0 ? scene.events[scene.events.length - 1].t : 1000;
+            const progress = lastEventTime / maxTime;
+            document.getElementById('timeline-progress').style.width = (progress * 100) + '%';
+        }
+
+        // ============ Ledger Rendering ============
+
+        function updateLedgerDisplay() {
+            const ledgerContainer = document.getElementById('ledger-rows');
+            ledgerContainer.innerHTML = '';
+
+            visibleLedgerRows.forEach(rowIndex => {
+                const row = fixture.ledger[rowIndex];
+                const rowEl = document.createElement('div');
+                rowEl.className = 'ledger-row';
+
+                const statusClass = row.status === 'settled' ? 'status-settled' : 'status-no-route';
+                const amountText = row.amount !== null ? `$${row.amount}` : '—';
+                const opIdText = row.op_payment_id || '—';
+
+                rowEl.innerHTML = `
+                    <span>${row.contributor}</span>
+                    <span><span class="${statusClass}">${row.status}</span></span>
+                    <span>${amountText} ${row.asset_code}</span>
+                    <span class="record-stands">${row.record || 'settled'}</span>
+                `;
+
+                ledgerContainer.appendChild(rowEl);
+            });
+
+            // Void principle line
+            const voidLine = document.getElementById('void-line');
+            voidLine.innerHTML = `<span>${fixture.void_principle.policy} — ${fixture.void_principle.statement}</span>`;
+
+            // Coda
+            const coda = document.getElementById('coda');
+            coda.innerHTML = `<span>${fixture.void_principle.record_not_money}</span><br><span>${fixture.void_principle.coda}</span>`;
+        }
+
+        // ============ Initialize ============
+
+        loadFixture().then(() => {
+            updateLedgerDisplay();
+            // Auto-start playback
+            play();
+        });
+    </script>
+</body>
+</html>
