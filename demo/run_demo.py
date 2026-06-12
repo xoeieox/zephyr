@@ -33,14 +33,6 @@ from unittest.mock import MagicMock, patch
 # Add parent dir to path for zephyr imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from zephyr.attribution import AttributionLog
-from zephyr.intent_queue import SettlementIntentQueue
-from zephyr.registry import PubkeyRegistry
-from zephyr.signing import AgentSigner
-from settler.ledger import SettlementLedger
-from settler.wallet_map import WalletMap
-from settler.run import Settler
-
 log = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -73,11 +65,12 @@ def load_demo_env() -> dict:
 
 
 def make_signed_deposit(
-    attr_log: AttributionLog,
-    signer: AgentSigner,
+    attr_log,
+    signer,
     contributor_name: str,
     manifest_hash: str,
     pubkey_id: str,
+    registry=None,
 ) -> dict:
     """Make a signed deposit to the attribution log.
 
@@ -99,7 +92,7 @@ def make_signed_deposit(
     provenance["signature"] = signature
 
     # Record (emits settlement intent if signed)
-    newly_recorded = attr_log.record(provenance)
+    newly_recorded = attr_log.record(provenance, registry=registry)
 
     if newly_recorded:
         log.info("Recorded signed deposit for %s (manifest_hash=%s)", contributor_name, manifest_hash)
@@ -137,12 +130,25 @@ def run_demo(
         queue_db = Path(tmp_dir) / "intent_queue.db"
         ledger_db = Path(tmp_dir) / "ledger.db"
         log.info("Using temporary DBs in %s", tmp_dir)
+        # Set environment variables so singletons use our temp DBs
+        os.environ["ZEPHYR_ATTRIBUTION_DB"] = str(attr_db)
+        os.environ["ZEPHYR_INTENT_QUEUE_DB"] = str(queue_db)
+
+    # Import all modules AFTER setting environment variables
+    from zephyr.attribution import AttributionLog
+    from zephyr.intent_queue import SettlementIntentQueue
+    from zephyr.registry import PubkeyRegistry
+    from zephyr.signing import AgentSigner
+    from settler.ledger import SettlementLedger
+    from settler.wallet_map import WalletMap
+    from settler.run import Settler
 
     # Initialize components
     attr_log = AttributionLog(attr_db)
     intent_queue = SettlementIntentQueue(queue_db)
     ledger = SettlementLedger(ledger_db)
     wallet_map = WalletMap(demo_env["ZEPHYR_SETTLER_WALLET_MAP"])
+    registry = PubkeyRegistry()
 
     # Load contributor keys
     keys_dir = Path(demo_env["ZEPHYR_DEMO_KEYS_DIR"])
@@ -169,7 +175,7 @@ def run_demo(
     manifest_a = f"sha256:demo-deposit-{contrib_a['name']}"
     pubkey_id_a = contrib_a["pubkey_id"]
 
-    prov_a = make_signed_deposit(attr_log, signer_a, contrib_a["name"], manifest_a, pubkey_id_a)
+    prov_a = make_signed_deposit(attr_log, signer_a, contrib_a["name"], manifest_a, pubkey_id_a, registry)
     results["contributors"].append(
         {"name": contrib_a["name"], "manifest_hash": manifest_a, "has_wallet": True}
     )
@@ -216,7 +222,7 @@ def run_demo(
     manifest_c = f"sha256:demo-deposit-{contrib_c['name']}"
     pubkey_id_c = contrib_c["pubkey_id"]
 
-    prov_c = make_signed_deposit(attr_log, signer_c, contrib_c["name"], manifest_c, pubkey_id_c)
+    prov_c = make_signed_deposit(attr_log, signer_c, contrib_c["name"], manifest_c, pubkey_id_c, registry)
     results["contributors"].append(
         {"name": contrib_c["name"], "manifest_hash": manifest_c, "has_wallet": False}
     )

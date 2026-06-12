@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 # Add parent dir to path for zephyr imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from zephyr.signing import pubkey_id as compute_pubkey_id
+from zephyr.registry import PubkeyRegistry
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -170,6 +171,64 @@ def create_wallet_map(
 
 
 # ============================================================================
+# Pubkey Registry Setup
+# ============================================================================
+
+
+def register_contributor_keys(
+    contributors: list[dict],
+    keys_dir: Path = DEMO_KEYS_DIR,
+    registry_dir: Path | None = None,
+) -> None:
+    """Register each contributor's public key in the registry.
+
+    Each contributor key is registered as role="agent" with the matching
+    agent_id from the contributors list. This allows signed deposits to pass
+    the registry check in AttributionLog.record().
+
+    Args:
+        contributors: List of contributor dicts with name, pubkey_id, etc.
+        keys_dir: Directory where PEM files are stored.
+        registry_dir: Directory for the pubkey registry. If None, uses the
+            environment variable ZEPHYR_KEYS_DIR or the default.
+    """
+    if registry_dir is None:
+        registry = PubkeyRegistry()
+    else:
+        registry = PubkeyRegistry(registry_dir)
+
+    for contrib in contributors:
+        pubkey_id = contrib["pubkey_id"]
+        name = contrib["name"]
+        agent_id = f"agent:{name}"
+
+        # Load the public key bytes from the private key
+        key_file = keys_dir / f"{name}.pem"
+        if not key_file.exists():
+            log.warning("Cannot register %s: key file not found at %s", name, key_file)
+            continue
+
+        pem_bytes = key_file.read_bytes()
+        key = serialization.load_pem_private_key(pem_bytes, password=None)
+        public_key = key.public_key()
+        public_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        public_hex = public_bytes.hex()
+
+        # Register the key
+        registry.register(
+            pubkey_id,
+            public_hex,
+            agent_id,
+            role="agent",
+            note=f"Demo contributor {name}",
+        )
+        log.info("Registered %s (agent_id=%s)", pubkey_id, agent_id)
+
+
+# ============================================================================
 # Demo Setup Orchestration
 # ============================================================================
 
@@ -179,11 +238,20 @@ def setup_demo(
     output_env_file: Optional[Path] = None,
     keys_dir: Path = DEMO_KEYS_DIR,
     wallet_map_path: Path = WALLET_MAP_PATH,
+    registry_dir: Optional[Path] = None,
 ) -> dict:
     """Orchestrate U0 demo setup.
 
     Creates N contributor keys (idempotent), one without wallet (no-route demo).
     Writes wallet map and returns environment matrix.
+
+    Args:
+        num_contributors: Number of synthetic contributors to create.
+        output_env_file: Optional path to write environment variables.
+        keys_dir: Directory for PEM key files.
+        wallet_map_path: Path for wallet_map.json output.
+        registry_dir: Optional directory for pubkey registry. If None, uses
+            environment variable ZEPHYR_KEYS_DIR or the default.
 
     Returns:
         Dict with keys: contributors, wallet_map, env_vars.
@@ -209,6 +277,9 @@ def setup_demo(
 
     # Create wallet map
     wallet_map = create_wallet_map(contributors, wallet_map_path)
+
+    # Register contributor keys in the pubkey registry
+    register_contributor_keys(contributors, keys_dir, registry_dir)
 
     # Construct environment matrix for demo script
     env_vars = {
