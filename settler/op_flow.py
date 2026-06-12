@@ -78,7 +78,6 @@ class OPClient:
         wallet_url: str,
         incoming_payment_id: str,
         token: str,
-        send_amount: dict,
     ) -> dict:
         """Request a quote from the destination wallet.
 
@@ -86,7 +85,6 @@ class OPClient:
             wallet_url: Recipient's wallet URL
             incoming_payment_id: ID of the incoming payment
             token: Bearer token
-            send_amount: Amount to send (e.g., {"value": "1", "assetCode": "USD", "assetScale": 2})
 
         Returns:
             Quote dict with:

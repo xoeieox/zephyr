@@ -233,6 +233,12 @@ def run_demo(
 
     if captured_run:
         scene_log = captured_run.start_scene("scene-1-original-no-wallet")
+        scene_log.set_title("An original, with no wallet")
+        scene_log.set_contributor(
+            f"agent:{contrib_original['name']}",
+            contrib_original["name"],
+            has_wallet=False,
+        )
         scene_log.emit("contributor", "settler", "deposit", "signs the original", {
             "artifact": "original",
             "manifest_hash": manifest_original,
@@ -310,6 +316,12 @@ def run_demo(
 
     if captured_run:
         scene_log = captured_run.start_scene("scene-2-remix-settles")
+        scene_log.set_title("A remix that builds on it, with a wallet")
+        scene_log.set_contributor(
+            f"agent:{contrib_remix['name']}",
+            contrib_remix["name"],
+            has_wallet=True,
+        )
         scene_log.emit("contributor", "settler", "deposit", "signs the remix", {
             "artifact": "remix",
             "manifest_hash": manifest_remix,
@@ -342,10 +354,19 @@ def run_demo(
         settler.drain(limit=10)
 
     ledger_remix = ledger.get(manifest_remix)
+    if captured_run:
+        scene_log = captured_run.scene_logs[-1]  # Get scene 2's log
     if ledger_remix and ledger_remix["status"] == "settled":
         log.info("✓ Remix settled: %s", ledger_remix["op_payment_id"])
         results["settled"].append(contrib_remix["name"])
         if captured_run:
+            scene_log.emit("settler", "settler", "ledger", "record settled ✓", {
+                "status": "settled",
+                "amount": 1,
+                "asset_code": "USD",
+                "op_payment_id": ledger_remix["op_payment_id"],
+                "attribution": "fully credited",
+            }, t=6100)
             captured_run.add_ledger_row(
                 contrib_remix["name"],
                 "remix",
@@ -359,6 +380,13 @@ def run_demo(
     elif ledger_remix and ledger_remix["status"] == "no-route":
         log.warning("! Remix marked no-route (unexpected; has wallet)")
         results["no_route"].append(contrib_remix["name"])
+        if captured_run:
+            scene_log.emit("settler", "settler", "ledger", "record no-route", {
+                "status": "no-route",
+                "amount": None,
+                "asset_code": "USD",
+                "attribution": "fully credited",
+            }, t=6100)
     else:
         log.warning("! Remix not in ledger (settlement may have failed)")
 

@@ -179,7 +179,6 @@ class Settler:
             if "interact" in grant_resp:
                 interact_info = grant_resp.get("interact", {})
                 approval_url = interact_info.get("redirect")
-                finish_key = interact_info.get("finish")
                 continue_token = grant_resp.get("continue", {}).get("access_token")
 
                 if approval_url:
@@ -203,16 +202,10 @@ class Settler:
             incoming_payment_id = incoming["id"]
 
             # Request quote
-            send_amount = {
-                "value": str(amount),
-                "assetCode": asset_code,
-                "assetScale": 2,
-            }
             quote = op_client.request_quote(
                 recipient_wallet,
                 incoming_payment_id,
                 token,
-                send_amount,
             )
 
             # Create outgoing payment from source

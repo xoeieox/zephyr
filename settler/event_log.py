@@ -53,6 +53,8 @@ class EventLog:
         self.scene_id = scene_id
         self.start_time = start_time or time.time()
         self.events: list[Event] = []
+        self.contributor_info: dict | None = None
+        self.title: str = ""
 
     def emit(
         self,
@@ -87,6 +89,24 @@ class EventLog:
         )
         self.events.append(event)
         log.debug("Event [%s] t=%d %s→%s: %s", self.scene_id, t, from_, to, label)
+
+    def set_contributor(self, agent_id: str, display: str, has_wallet: bool) -> None:
+        """Set contributor metadata for this scene.
+
+        Args:
+            agent_id: Agent ID (e.g., "agent:contributor_01")
+            display: Display name
+            has_wallet: Whether contributor has a wallet
+        """
+        self.contributor_info = {
+            "agent_id": agent_id,
+            "display": display,
+            "has_wallet": has_wallet,
+        }
+
+    def set_title(self, title: str) -> None:
+        """Set the scene title."""
+        self.title = title
 
     def to_list(self) -> list[dict]:
         """Return events as list of dicts."""
@@ -213,8 +233,6 @@ class CapturedRun:
         # Build scenes with events
         scenes_out = []
         for scene_log in self.scene_logs:
-            # Infer from the first event (crude, but works for the demo)
-            contributor_info = None
             outcome = None
             artifact_id = None
 
@@ -223,15 +241,11 @@ class CapturedRun:
                     artifact_id = event.detail["artifact"]
                 if event.kind == "ledger":
                     outcome = event.detail.get("status")
-                    if "amount" not in event.detail and event.detail.get("status") == "no-route":
-                        outcome = "no-route"
-                    else:
-                        outcome = "settled"
 
             scene_obj = {
                 "id": scene_log.scene_id,
-                "title": "",  # Caller sets this separately if needed
-                "contributor": contributor_info,
+                "title": scene_log.title,
+                "contributor": scene_log.contributor_info,
                 "artifact": artifact_id,
                 "outcome": outcome,
                 "events": scene_log.to_list(),
