@@ -176,15 +176,26 @@ def create_wallet_map(
 
 
 def register_contributor_keys(
-    contributors: list[dict], keys_dir: Path = DEMO_KEYS_DIR
+    contributors: list[dict],
+    keys_dir: Path = DEMO_KEYS_DIR,
+    registry_dir: Path | None = None,
 ) -> None:
     """Register each contributor's public key in the registry.
 
     Each contributor key is registered as role="agent" with the matching
     agent_id from the contributors list. This allows signed deposits to pass
     the registry check in AttributionLog.record().
+
+    Args:
+        contributors: List of contributor dicts with name, pubkey_id, etc.
+        keys_dir: Directory where PEM files are stored.
+        registry_dir: Directory for the pubkey registry. If None, uses the
+            environment variable ZEPHYR_KEYS_DIR or the default.
     """
-    registry = PubkeyRegistry()
+    if registry_dir is None:
+        registry = PubkeyRegistry()
+    else:
+        registry = PubkeyRegistry(registry_dir)
 
     for contrib in contributors:
         pubkey_id = contrib["pubkey_id"]
@@ -227,11 +238,20 @@ def setup_demo(
     output_env_file: Optional[Path] = None,
     keys_dir: Path = DEMO_KEYS_DIR,
     wallet_map_path: Path = WALLET_MAP_PATH,
+    registry_dir: Optional[Path] = None,
 ) -> dict:
     """Orchestrate U0 demo setup.
 
     Creates N contributor keys (idempotent), one without wallet (no-route demo).
     Writes wallet map and returns environment matrix.
+
+    Args:
+        num_contributors: Number of synthetic contributors to create.
+        output_env_file: Optional path to write environment variables.
+        keys_dir: Directory for PEM key files.
+        wallet_map_path: Path for wallet_map.json output.
+        registry_dir: Optional directory for pubkey registry. If None, uses
+            environment variable ZEPHYR_KEYS_DIR or the default.
 
     Returns:
         Dict with keys: contributors, wallet_map, env_vars.
@@ -259,7 +279,7 @@ def setup_demo(
     wallet_map = create_wallet_map(contributors, wallet_map_path)
 
     # Register contributor keys in the pubkey registry
-    register_contributor_keys(contributors, keys_dir)
+    register_contributor_keys(contributors, keys_dir, registry_dir)
 
     # Construct environment matrix for demo script
     env_vars = {

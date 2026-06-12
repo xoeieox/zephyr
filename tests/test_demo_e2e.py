@@ -4,13 +4,9 @@ Tests that the demo script runs successfully with proper registration of
 contributor pubkeys, and produces the expected settlement outcomes.
 """
 
-import json
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
-
-import pytest
 
 
 def test_demo_setup_registers_pubkeys_in_registry():
@@ -18,19 +14,17 @@ def test_demo_setup_registers_pubkeys_in_registry():
 
     This is the core fix for zephyr-demo-runnable-v0: the demo previously
     crashed with "unknown pubkey_id" error because setup_demo never registered
-    the keys. This test verifies the fix is in place.
+    the keys. This test verifies the fix is in place and checks that the
+    registry dir is properly isolated from production.
     """
-    # Set up temp directories
+    # Set up isolated temp directories
     tmp_dir = Path(tempfile.mkdtemp(prefix="zephyr-demo-registry-"))
     keys_dir = tmp_dir / "demo-keys"
     wallet_map_path = tmp_dir / "wallet_map.json"
     registry_dir = tmp_dir / "registry"
-
-    # Set ZEPHYR_KEYS_DIR BEFORE importing setup_demo so registry uses our temp dir
     registry_dir.mkdir(exist_ok=True)
-    os.environ["ZEPHYR_KEYS_DIR"] = str(registry_dir)
 
-    # Run setup_demo (U0)
+    # Run setup_demo with explicit registry_dir parameter (no env-var coupling)
     from fixtures.setup_demo import setup_demo
 
     setup_result = setup_demo(
@@ -38,13 +32,14 @@ def test_demo_setup_registers_pubkeys_in_registry():
         output_env_file=None,
         keys_dir=keys_dir,
         wallet_map_path=wallet_map_path,
+        registry_dir=registry_dir,
     )
 
     # Verify setup completed
     assert len(setup_result["contributors"]) == 3
     assert setup_result["contributors"][-1]["no_wallet"] is True
 
-    # Verify the registry has the registered keys
+    # Verify the registry has the registered keys (create fresh instance pointing to registry_dir)
     from zephyr.registry import PubkeyRegistry
 
     registry = PubkeyRegistry(registry_dir)
@@ -65,65 +60,20 @@ def test_demo_setup_registers_pubkeys_in_registry():
         assert entry["status"] == "active", "Key should be active"
 
 
-def test_demo_setup_registers_pubkeys():
-    """Test that setup_demo registers contributor pubkeys in the registry.
-
-    This ensures the fix for the 'unknown pubkey_id' crash is in place.
-    """
-    tmp_dir = Path(tempfile.mkdtemp(prefix="zephyr-demo-pubkeys-"))
-    keys_dir = tmp_dir / "demo-keys"
-    wallet_map_path = tmp_dir / "wallet_map.json"
-
-    from fixtures.setup_demo import setup_demo
-    from zephyr.registry import PubkeyRegistry
-
-    # Run setup with custom temp dirs
-    setup_result = setup_demo(
-        num_contributors=3,
-        output_env_file=None,
-        keys_dir=keys_dir,
-        wallet_map_path=wallet_map_path,
-    )
-
-    # Verify registry has all contributor keys
-    # Create a fresh registry instance pointing to the same location
-    import zephyr.registry as reg_module
-
-    # Save original and temporarily override the default keys dir
-    original_default = reg_module.DEFAULT_KEYS_DIR
-    reg_module.DEFAULT_KEYS_DIR = reg_module.Path(
-        os.environ.get("ZEPHYR_KEYS_DIR", "/data/zephyr/keys")
-    )
-
-    registry = PubkeyRegistry()
-    all_keys = registry.load_all()
-
-    # Restore original
-    reg_module.DEFAULT_KEYS_DIR = original_default
-
-    assert len(all_keys) >= 3, f"Expected at least 3 registered keys, got {len(all_keys)}"
-
-    # Verify each contributor's key is registered with correct role and agent_id
-    for contrib in setup_result["contributors"]:
-        pubkey_id = contrib["pubkey_id"]
-        entry = registry.lookup(pubkey_id)
-        assert entry is not None, f"Pubkey {pubkey_id} not registered"
-        assert entry["role"] == "agent", f"Expected role='agent', got {entry['role']}"
-        assert (
-            entry["agent_id"] == f"agent:{contrib['name']}"
-        ), f"Pubkey registered to wrong agent_id"
-
-
 def test_demo_deposits_are_verified():
     """Test that signed deposits in the demo pass signature verification.
 
     This ensures the real attribution gate is used, not a stub.
+    Uses isolated temp directories for keys and registry to avoid contaminating
+    production stores.
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="zephyr-demo-verify-"))
     keys_dir = tmp_dir / "demo-keys"
     wallet_map_path = tmp_dir / "wallet_map.json"
+    registry_dir = tmp_dir / "registry"
+    registry_dir.mkdir(exist_ok=True)
 
-    # Setup
+    # Setup with isolated directories
     from fixtures.setup_demo import setup_demo
 
     setup_result = setup_demo(
@@ -131,20 +81,19 @@ def test_demo_deposits_are_verified():
         output_env_file=None,
         keys_dir=keys_dir,
         wallet_map_path=wallet_map_path,
+        registry_dir=registry_dir,
     )
 
-    # Set env vars before importing zephyr (critical!)
-    os.environ["ZEPHYR_ATTRIBUTION_DB"] = str(tmp_dir / "attribution.db")
-    os.environ["ZEPHYR_INTENT_QUEUE_DB"] = str(tmp_dir / "intent_queue.db")
-
-    # Import zephyr modules AFTER env is set
+    # Import zephyr modules (attribution.py can use module-level registry)
     from zephyr.attribution import AttributionLog, verify_row
     from zephyr.registry import PubkeyRegistry
     from zephyr.signing import AgentSigner
     from datetime import datetime, timezone
 
+    # Use isolated temp databases
     attr_log = AttributionLog(tmp_dir / "attribution.db")
-    registry = PubkeyRegistry()
+    # Create a registry instance pointing to our isolated registry_dir
+    registry = PubkeyRegistry(registry_dir)
 
     # Make a signed deposit like the demo does
     contrib = setup_result["contributors"][0]
