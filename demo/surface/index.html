@@ -396,6 +396,25 @@
             font-size: 12px;
             text-align: center;
         }
+
+        .grant-approval-highlight {
+            animation: approvalPulse 1.5s ease-in-out;
+        }
+
+        @keyframes approvalPulse {
+            0% {
+                background: rgba(76, 175, 80, 0.2);
+                border-color: var(--color-success);
+            }
+            50% {
+                background: rgba(76, 175, 80, 0.1);
+                border-color: var(--color-success);
+            }
+            100% {
+                background: transparent;
+                border-color: var(--color-pane-border);
+            }
+        }
     </style>
 </head>
 <body>
@@ -474,9 +493,10 @@
         let playbackSpeed = 1;
         let sceneStartTime = 0;
         let totalDuration = 0;
-        let animationFrameId = null;
+        let packetAnimationIds = [];
         let eventQueue = [];
         let lastEventTime = 0;
+        let visibleLedgerRows = [];
 
         const panes = {
             contributor: { element: document.querySelector('.pane.contributor'), logElement: document.getElementById('contributor-log'), status: document.getElementById('contributor-status') },
@@ -628,6 +648,7 @@
             currentEventIndex = 0;
             lastEventTime = 0;
             eventQueue = [];
+            visibleLedgerRows = [];
 
             const scene = fixture.scenes[sceneIndex];
             document.getElementById('scene-label').textContent = `${sceneIndex + 1}. ${scene.title}`;
@@ -646,16 +667,6 @@
 
             // Render artifact
             renderArtifact(scene);
-
-            // Render void banner if scene 2
-            if (sceneIndex === 1) {
-                document.getElementById('void-banner').style.display = 'block';
-            }
-
-            // Render lineage if present
-            if (sceneIndex === 1) {
-                renderLineage();
-            }
 
             sceneStartTime = Date.now();
             lastEventTime = 0;
@@ -739,27 +750,32 @@
 
         function createLineageSVG(originArtifact, remixArtifact) {
             const nodeSize = 60;
-            const spacing = 120;
+            const nodeY = 50;
+            const originX = 60;
+            const remixX = 240;
             const treeHeight = 160;
+
+            // Curved cubic bezier with offset control points for visual arc
+            const cpY1 = nodeY - 30; // Control point above the line
 
             const svg = `
                 <svg width="100%" height="${treeHeight}" viewBox="0 0 300 160" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
-                    <!-- Edge (cubic bezier) -->
-                    <path d="M 60 80 C 120 80 120 80 180 80" stroke="#9c27b0" stroke-width="2" fill="none" stroke-dasharray="4,4" opacity="0.6"/>
+                    <!-- Edge (cubic bezier with curved control points) -->
+                    <path class="edge-path" d="M ${originX + nodeSize / 2} ${nodeY + nodeSize / 2} C ${originX + nodeSize / 2} ${cpY1}, ${remixX - nodeSize / 2} ${cpY1}, ${remixX - nodeSize / 2} ${nodeY + nodeSize / 2}" stroke="#9c27b0" stroke-width="2" fill="none" stroke-dasharray="4,4" opacity="0.6"/>
 
                     <!-- Origin node -->
-                    <rect x="30" y="50" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#7cb342" stroke-width="2"/>
-                    <text x="60" y="75" text-anchor="middle" font-size="10" font-family="monospace" fill="#7cb342">origin</text>
-                    <text x="60" y="88" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">${originArtifact.manifest_hash.substring(0, 8)}</text>
+                    <rect class="node-rect" x="${originX}" y="${nodeY}" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#7cb342" stroke-width="2"/>
+                    <text x="${originX + nodeSize / 2}" y="${nodeY + nodeSize / 2 + 5}" text-anchor="middle" font-size="10" font-family="monospace" fill="#7cb342">origin</text>
+                    <text x="${originX + nodeSize / 2}" y="${nodeY + nodeSize / 2 + 18}" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">${originArtifact.manifest_hash.substring(0, 8)}</text>
 
                     <!-- Remix node -->
-                    <rect x="210" y="50" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#9c27b0" stroke-width="2"/>
-                    <text x="240" y="75" text-anchor="middle" font-size="10" font-family="monospace" fill="#9c27b0">remix</text>
-                    <text x="240" y="88" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">${remixArtifact.manifest_hash.substring(0, 8)}</text>
+                    <rect class="node-rect" x="${remixX - nodeSize}" y="${nodeY}" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#9c27b0" stroke-width="2"/>
+                    <text x="${remixX - nodeSize / 2}" y="${nodeY + nodeSize / 2 + 5}" text-anchor="middle" font-size="10" font-family="monospace" fill="#9c27b0">remix</text>
+                    <text x="${remixX - nodeSize / 2}" y="${nodeY + nodeSize / 2 + 18}" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">${remixArtifact.manifest_hash.substring(0, 8)}</text>
 
                     <!-- Edge label -->
-                    <text x="150" y="50" text-anchor="middle" font-size="9" font-family="monospace" fill="#9c27b0">derived_from</text>
-                    <text x="150" y="62" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">signed claim</text>
+                    <text x="150" y="20" text-anchor="middle" font-size="9" font-family="monospace" fill="#9c27b0">derived_from</text>
+                    <text x="150" y="32" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">signed claim</text>
                 </svg>
             `;
             return svg;
@@ -775,7 +791,8 @@
 
         function pause() {
             isPlaying = false;
-            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            packetAnimationIds.forEach(id => cancelAnimationFrame(id));
+            packetAnimationIds = [];
         }
 
         function restart() {
@@ -834,6 +851,32 @@
                 panes[event.to].element.classList.add('active');
             }
 
+            // Handle special event kinds
+            if (event.kind === 'policy') {
+                document.getElementById('void-banner').style.display = 'block';
+            }
+
+            if (event.kind === 'lineage') {
+                renderLineage();
+                document.getElementById('lineage-tree').style.display = 'block';
+            }
+
+            if (event.kind === 'ledger') {
+                // Add corresponding ledger row (scene 0 -> row 0, scene 1 -> row 1)
+                visibleLedgerRows.push(currentScene);
+                updateLedgerDisplay();
+            }
+
+            if (event.kind === 'grant_approval') {
+                // Apply consent-beat visual highlight to contributor pane
+                const contributorPane = panes.contributor.element;
+                contributorPane.classList.add('grant-approval-highlight');
+                // Remove highlight after animation completes
+                setTimeout(() => {
+                    contributorPane.classList.remove('grant-approval-highlight');
+                }, 1500);
+            }
+
             // Log the event
             logEvent(event);
 
@@ -852,7 +895,7 @@
         }
 
         function logEvent(event) {
-            const targetPane = event.to || event.from;
+            const targetPane = event.from || event.to;
             if (!panes[targetPane]) return;
 
             const logContainer = panes[targetPane].logElement;
@@ -900,6 +943,7 @@
 
             const duration = 600;
             const startTime = Date.now();
+            let frameId = null;
 
             function animateFrame() {
                 const elapsed = Date.now() - startTime;
@@ -909,13 +953,17 @@
                 packet.style.top = (startY + (endY - startY) * progress) + 'px';
 
                 if (progress < 1) {
-                    requestAnimationFrame(animateFrame);
+                    frameId = requestAnimationFrame(animateFrame);
+                    packetAnimationIds.push(frameId);
                 } else {
                     packet.remove();
+                    const idx = packetAnimationIds.indexOf(frameId);
+                    if (idx > -1) packetAnimationIds.splice(idx, 1);
                 }
             }
 
-            requestAnimationFrame(animateFrame);
+            frameId = requestAnimationFrame(animateFrame);
+            packetAnimationIds.push(frameId);
         }
 
         function updateTimeline() {
@@ -927,11 +975,12 @@
 
         // ============ Ledger Rendering ============
 
-        function renderLedger() {
+        function updateLedgerDisplay() {
             const ledgerContainer = document.getElementById('ledger-rows');
             ledgerContainer.innerHTML = '';
 
-            fixture.ledger.forEach(row => {
+            visibleLedgerRows.forEach(rowIndex => {
+                const row = fixture.ledger[rowIndex];
                 const rowEl = document.createElement('div');
                 rowEl.className = 'ledger-row';
 
@@ -961,7 +1010,7 @@
         // ============ Initialize ============
 
         loadFixture().then(() => {
-            renderLedger();
+            updateLedgerDisplay();
             // Auto-start playback
             play();
         });
