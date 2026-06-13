@@ -492,7 +492,6 @@
         let isPlaying = false;
         let playbackSpeed = 1;
         let sceneStartTime = 0;
-        let totalDuration = 0;
         let packetAnimationIds = [];
         let eventQueue = [];
         let lastEventTime = 0;
@@ -606,9 +605,6 @@
             // Provenance badge
             document.getElementById('provenance-badge').textContent = fixture.run.mode;
 
-            // Calculate total duration
-            calculateTotalDuration();
-
             // Setup controls
             document.getElementById('play-btn').addEventListener('click', play);
             document.getElementById('pause-btn').addEventListener('click', pause);
@@ -623,17 +619,6 @@
 
             // Load first scene
             loadScene(0);
-        }
-
-        function calculateTotalDuration() {
-            let maxDuration = 0;
-            fixture.scenes.forEach((scene, sceneIdx) => {
-                if (scene.events.length > 0) {
-                    const lastEvent = scene.events[scene.events.length - 1];
-                    maxDuration = Math.max(maxDuration, lastEvent.t);
-                }
-            });
-            totalDuration = maxDuration;
         }
 
         // ============ Scene Loading ============
@@ -761,15 +746,15 @@
             const svg = `
                 <svg width="100%" height="${treeHeight}" viewBox="0 0 300 160" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
                     <!-- Edge (cubic bezier with curved control points) -->
-                    <path class="edge-path" d="M ${originX + nodeSize / 2} ${nodeY + nodeSize / 2} C ${originX + nodeSize / 2} ${cpY1}, ${remixX - nodeSize / 2} ${cpY1}, ${remixX - nodeSize / 2} ${nodeY + nodeSize / 2}" stroke="#9c27b0" stroke-width="2" fill="none" stroke-dasharray="4,4" opacity="0.6"/>
+                    <path d="M ${originX + nodeSize / 2} ${nodeY + nodeSize / 2} C ${originX + nodeSize / 2} ${cpY1}, ${remixX - nodeSize / 2} ${cpY1}, ${remixX - nodeSize / 2} ${nodeY + nodeSize / 2}" stroke="#9c27b0" stroke-width="2" fill="none" stroke-dasharray="4,4" opacity="0.6"/>
 
                     <!-- Origin node -->
-                    <rect class="node-rect" x="${originX}" y="${nodeY}" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#7cb342" stroke-width="2"/>
+                    <rect x="${originX}" y="${nodeY}" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#7cb342" stroke-width="2"/>
                     <text x="${originX + nodeSize / 2}" y="${nodeY + nodeSize / 2 + 5}" text-anchor="middle" font-size="10" font-family="monospace" fill="#7cb342">origin</text>
                     <text x="${originX + nodeSize / 2}" y="${nodeY + nodeSize / 2 + 18}" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">${originArtifact.manifest_hash.substring(0, 8)}</text>
 
                     <!-- Remix node -->
-                    <rect class="node-rect" x="${remixX - nodeSize}" y="${nodeY}" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#9c27b0" stroke-width="2"/>
+                    <rect x="${remixX - nodeSize}" y="${nodeY}" width="${nodeSize}" height="${nodeSize}" rx="4" fill="#1a1a1a" stroke="#9c27b0" stroke-width="2"/>
                     <text x="${remixX - nodeSize / 2}" y="${nodeY + nodeSize / 2 + 5}" text-anchor="middle" font-size="10" font-family="monospace" fill="#9c27b0">remix</text>
                     <text x="${remixX - nodeSize / 2}" y="${nodeY + nodeSize / 2 + 18}" text-anchor="middle" font-size="8" font-family="monospace" fill="#666">${remixArtifact.manifest_hash.substring(0, 8)}</text>
 
@@ -862,8 +847,10 @@
             }
 
             if (event.kind === 'ledger') {
-                // Add corresponding ledger row (scene 0 -> row 0, scene 1 -> row 1)
-                visibleLedgerRows.push(currentScene);
+                const rowIndex = fixture.ledger.findIndex(
+                    r => r.contributor === scene.contributor.display && r.artifact === scene.artifact
+                );
+                if (rowIndex !== -1) visibleLedgerRows.push(rowIndex);
                 updateLedgerDisplay();
             }
 
@@ -986,13 +973,19 @@
 
                 const statusClass = row.status === 'settled' ? 'status-settled' : 'status-no-route';
                 const amountText = row.amount !== null ? `$${row.amount}` : '—';
-                const opIdText = row.op_payment_id || '—';
+
+                let fourthColumn = '—';
+                if (row.attribution && row.record) {
+                    fourthColumn = `${row.attribution} — ${row.record}`;
+                } else if (row.attribution) {
+                    fourthColumn = row.attribution;
+                }
 
                 rowEl.innerHTML = `
                     <span>${row.contributor}</span>
                     <span><span class="${statusClass}">${row.status}</span></span>
                     <span>${amountText} ${row.asset_code}</span>
-                    <span class="record-stands">${row.record || 'settled'}</span>
+                    <span class="record-stands">${fourthColumn}</span>
                 `;
 
                 ledgerContainer.appendChild(rowEl);
