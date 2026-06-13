@@ -288,7 +288,12 @@ def test_demo_emit_json_schema_valid():
         assert len(doc["ledger"]) >= 2, "Expected at least 2 ledger rows"
         ledger_statuses = {row["status"] for row in doc["ledger"]}
         assert "no-route" in ledger_statuses, "ledger should have a no-route row"
-        assert "settled" in ledger_statuses or True, "ledger should have a settled row (or none in dry-run mock)"
+        assert "settled" in ledger_statuses, "ledger should have a settled row"
+
+        # Verify Act 3 contains all required event kinds (OP request/response pairs and GNAP grant flow)
+        act3_kinds = {e["kind"] for e in act_3["events"]}
+        required_kinds = {"op_request", "op_response", "grant_request", "grant_interaction", "grant_approval", "grant_response"}
+        assert required_kinds <= act3_kinds, f"Act 3 missing required event kinds. Expected {required_kinds}, got {act3_kinds}"
 
         # Check void_principle
         assert "void_principle" in doc, "Missing void_principle"

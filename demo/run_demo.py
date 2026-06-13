@@ -517,15 +517,18 @@ def run_demo(
     print("=" * 80)
     print()
 
+    # Build mapping from pubkey_id to contributor display names
+    contrib_map = {contrib["pubkey_id"]: contrib["name"] for contrib in contributors}
+
     rows = ledger.all()
     print(f"{'User':<20} {'Status':<12} {'Amount':<10} {'Attribution':<20}")
     print("-" * 65)
 
     for row in rows:
-        pubkey_id = row["pubkey_id"][:18]
+        pubkey_id = row["pubkey_id"]
         status = row["status"]
         amount_str = "—" if status == "no-route" or not row["amount"] else f"${row['amount'] / 100:.2f}"
-        user_name = "User A" if status == "no-route" else "User B"  # Simple mapping for demo
+        user_name = contrib_map.get(pubkey_id, f"Unknown ({pubkey_id[:18]})")
         print(f"{user_name:<20} {status:<12} {amount_str:<10} fully credited")
 
     print()
