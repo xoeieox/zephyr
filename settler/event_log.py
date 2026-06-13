@@ -1,12 +1,12 @@
 """Event-log emitter for captured settlement runs.
 
 Structures all settlement activity as timestamped events conforming to the
-shared contract (zephyr-demo-eventlog.example.json, schema 1.1).
+shared contract (zephyr-demo-eventlog.example.json, schema 1.2 - 3-act model).
 
 Event format: {t, from, to, kind, label, detail}
   t: milliseconds relative to scene start
   from/to: actor IDs from the actors list
-  kind: event classification (deposit, route, op_request, grant_interaction, etc.)
+  kind: event classification (deposit, lineage, policy, route, op_request, grant_interaction, etc.)
   label: human-readable description
   detail: event-specific data dict (includes raw request/response for OP calls)
 """
@@ -47,7 +47,7 @@ class EventLog:
         """Initialize event log for a scene.
 
         Args:
-            scene_id: Identifier for this scene (e.g., "scene-1-original-no-wallet")
+            scene_id: Identifier for this scene (e.g., "act-1-deposit")
             start_time: Unix timestamp for scene start (default: now)
         """
         self.scene_id = scene_id
@@ -55,6 +55,7 @@ class EventLog:
         self.events: list[Event] = []
         self.contributor_info: dict | None = None
         self.title: str = ""
+        self.outcome: str | None = None  # Explicit outcome, can be set via set_outcome()
 
     def emit(
         self,
@@ -90,23 +91,29 @@ class EventLog:
         self.events.append(event)
         log.debug("Event [%s] t=%d %s→%s: %s", self.scene_id, t, from_, to, label)
 
-    def set_contributor(self, agent_id: str, display: str, has_wallet: bool) -> None:
+    def set_contributor(self, agent_id: str, display: str, has_wallet: bool, role: str = "depositor") -> None:
         """Set contributor metadata for this scene.
 
         Args:
             agent_id: Agent ID (e.g., "agent:contributor_01")
             display: Display name
             has_wallet: Whether contributor has a wallet
+            role: Role in this act (depositor, remixer, purchaser)
         """
         self.contributor_info = {
-            "agent_id": agent_id,
+            "id": agent_id.replace("agent:", "").lower(),
             "display": display,
+            "role": role,
             "has_wallet": has_wallet,
         }
 
     def set_title(self, title: str) -> None:
         """Set the scene title."""
         self.title = title
+
+    def set_outcome(self, outcome: str) -> None:
+        """Set the scene outcome explicitly (e.g., 'settled', 'attributed', 'no-route')."""
+        self.outcome = outcome
 
     def to_list(self) -> list[dict]:
         """Return events as list of dicts."""
@@ -184,7 +191,7 @@ class CapturedRun:
 
     def add_ledger_row(
         self,
-        contributor: str,
+        user: str,
         artifact: str,
         status: str,
         amount: int | None,
@@ -196,7 +203,7 @@ class CapturedRun:
     ) -> None:
         """Add a ledger row to the final summary."""
         row = {
-            "contributor": contributor,
+            "user": user,
             "artifact": artifact,
             "status": status,
             "amount": amount,
@@ -217,7 +224,7 @@ class CapturedRun:
         return scene_log
 
     def finalize(self, captured_at: str | None = None) -> dict:
-        """Finalize the run and return the complete event-log document.
+        """Finalize the run and return the complete event-log document (schema 1.2).
 
         Args:
             captured_at: ISO8601 timestamp (default: now)
@@ -233,27 +240,40 @@ class CapturedRun:
         # Build scenes with events
         scenes_out = []
         for scene_log in self.scene_logs:
-            outcome = None
+            # Use explicit outcome if set, otherwise infer from events
+            outcome = scene_log.outcome
             artifact_id = None
 
-            for event in scene_log.events:
-                if "artifact" in event.detail:
-                    artifact_id = event.detail["artifact"]
-                if event.kind == "ledger":
-                    outcome = event.detail.get("status")
+            if not outcome:
+                # Infer outcome from events (first deposit/settlement determines it)
+                for event in scene_log.events:
+                    if "artifact" in event.detail:
+                        artifact_id = event.detail["artifact"]
+                    # Use first event with a status as the outcome
+                    if event.kind in ("ledger", "purchase", "deposit") and "status" in event.detail:
+                        if outcome is None:  # Only set if not already set
+                            outcome = event.detail["status"]
+                            break
+
+            # Extract artifact_id from events if not already found
+            if not artifact_id:
+                for event in scene_log.events:
+                    if "artifact" in event.detail:
+                        artifact_id = event.detail["artifact"]
+                        break
 
             scene_obj = {
                 "id": scene_log.scene_id,
                 "title": scene_log.title,
-                "contributor": scene_log.contributor_info,
+                "user": scene_log.contributor_info,
                 "artifact": artifact_id,
-                "outcome": outcome,
+                "outcome": outcome or "attributed",
                 "events": scene_log.to_list(),
             }
             scenes_out.append(scene_obj)
 
         return {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "run": {
                 "id": self.run_id,
                 "mode": self.mode,
