@@ -200,9 +200,9 @@ def test_demo_emit_json_schema_valid():
         # Parse and validate schema
         doc = json.loads(emit_path.read_text())
 
-        # Check top-level keys
+        # Check top-level keys (schema 1.2 - 3-act model)
         assert "schema_version" in doc, "Missing schema_version"
-        assert doc["schema_version"] == "1.1", f"Expected schema_version 1.1, got {doc['schema_version']}"
+        assert doc["schema_version"] == "1.2", f"Expected schema_version 1.2, got {doc['schema_version']}"
 
         # Check run block
         assert "run" in doc, "Missing run block"
@@ -219,7 +219,7 @@ def test_demo_emit_json_schema_valid():
         assert "actors" in doc, "Missing actors"
         assert len(doc["actors"]) >= 3, "Expected at least 3 actors"
         actor_ids = {a["id"] for a in doc["actors"]}
-        assert "contributor" in actor_ids, "Missing contributor actor"
+        assert "user" in actor_ids, "Missing user actor"
         assert "settler" in actor_ids, "Missing settler actor"
         assert "rafiki" in actor_ids, "Missing rafiki actor"
 
@@ -227,32 +227,32 @@ def test_demo_emit_json_schema_valid():
         assert "artifacts" in doc, "Missing artifacts"
         assert len(doc["artifacts"]) >= 2, "Expected at least 2 artifacts"
         artifact_ids = {a["id"] for a in doc["artifacts"]}
-        assert "original" in artifact_ids, "Missing original artifact"
-        assert "remix" in artifact_ids, "Missing remix artifact"
+        assert "smiley" in artifact_ids, "Missing smiley artifact"
+        assert "hat-remix" in artifact_ids, "Missing hat-remix artifact"
 
         # Check that remix has derived_from pointing to original's manifest_hash
-        remix_artifact = next(a for a in doc["artifacts"] if a["id"] == "remix")
-        original_artifact = next(a for a in doc["artifacts"] if a["id"] == "original")
+        remix_artifact = next(a for a in doc["artifacts"] if a["id"] == "hat-remix")
+        original_artifact = next(a for a in doc["artifacts"] if a["id"] == "smiley")
         assert "derived_from" in remix_artifact, "remix artifact missing derived_from"
         assert remix_artifact["derived_from"] == original_artifact["manifest_hash"], \
             "remix derived_from should point to original manifest_hash"
 
-        # Check scenes
+        # Check scenes (3-act model: act-1-deposit, act-2-remix, act-3-purchase)
         assert "scenes" in doc, "Missing scenes"
-        assert len(doc["scenes"]) >= 2, "Expected at least 2 scenes"
+        assert len(doc["scenes"]) >= 3, "Expected at least 3 scenes (acts)"
 
         for scene in doc["scenes"]:
             assert "id" in scene, "scene missing id"
             assert "title" in scene, "scene missing title"
             assert scene["title"], "scene title should not be empty"
-            assert "contributor" in scene, "scene missing contributor"
-            assert scene["contributor"] is not None, "scene contributor should not be null"
-            assert "agent_id" in scene["contributor"], "contributor missing agent_id"
-            assert "display" in scene["contributor"], "contributor missing display"
-            assert "has_wallet" in scene["contributor"], "contributor missing has_wallet"
+            assert "user" in scene, "scene missing user"
+            assert scene["user"] is not None, "scene user should not be null"
+            assert "id" in scene["user"], "user missing id"
+            assert "display" in scene["user"], "user missing display"
+            assert "has_wallet" in scene["user"], "user missing has_wallet"
             assert "artifact" in scene, "scene missing artifact"
             assert "outcome" in scene, "scene missing outcome"
-            assert scene["outcome"] in ("no-route", "settled"), f"unexpected outcome: {scene['outcome']}"
+            assert scene["outcome"] in ("no-route", "settled", "attributed"), f"unexpected outcome: {scene['outcome']}"
             assert "events" in scene, "scene missing events"
             assert len(scene["events"]) > 0, "scene should have at least one event"
 
@@ -265,25 +265,35 @@ def test_demo_emit_json_schema_valid():
                 assert "label" in event, "event missing label"
                 assert "detail" in event, "event missing detail"
 
-        # Check scene 1 (original, no-route)
-        scene_1 = next(s for s in doc["scenes"] if s["id"] == "scene-1-original-no-wallet")
-        assert scene_1["outcome"] == "no-route", "Scene 1 should have outcome=no-route"
-        assert scene_1["contributor"]["has_wallet"] is False, "Scene 1 contributor should have has_wallet=false"
-        # Verify no Rafiki events in scene 1 (no OP calls for no-route)
-        rafiki_events = [e for e in scene_1["events"] if e.get("to") == "rafiki"]
-        assert len(rafiki_events) == 0, "Scene 1 should have no Rafiki events (no-route)"
+        # Check Act 1 (original, no-route)
+        act_1 = next(s for s in doc["scenes"] if s["id"] == "act-1-deposit")
+        assert act_1["outcome"] == "attributed", "Act 1 should have outcome=attributed"
+        assert act_1["user"]["has_wallet"] is False, "Act 1 user should have has_wallet=false"
+        # Verify no Rafiki events in act 1 (no OP calls for original deposit)
+        rafiki_events = [e for e in act_1["events"] if e.get("to") == "rafiki"]
+        assert len(rafiki_events) == 0, "Act 1 should have no Rafiki events (deposit only)"
 
-        # Check scene 2 (remix, settled)
-        scene_2 = next(s for s in doc["scenes"] if s["id"] == "scene-2-remix-settles")
-        assert scene_2["outcome"] == "settled", "Scene 2 should have outcome=settled"
-        assert scene_2["contributor"]["has_wallet"] is True, "Scene 2 contributor should have has_wallet=true"
+        # Check Act 2 (remix, no settlement yet)
+        act_2 = next(s for s in doc["scenes"] if s["id"] == "act-2-remix")
+        assert act_2["outcome"] == "attributed", "Act 2 should have outcome=attributed"
+        assert act_2["user"]["has_wallet"] is True, "Act 2 user should have has_wallet=true"
+
+        # Check Act 3 (purchase, settlement)
+        act_3 = next(s for s in doc["scenes"] if s["id"] == "act-3-purchase")
+        assert act_3["outcome"] == "settled", "Act 3 should have outcome=settled"
+        assert act_3["user"]["has_wallet"] is True, "Act 3 user should have has_wallet=true"
 
         # Check ledger
         assert "ledger" in doc, "Missing ledger"
         assert len(doc["ledger"]) >= 2, "Expected at least 2 ledger rows"
         ledger_statuses = {row["status"] for row in doc["ledger"]}
         assert "no-route" in ledger_statuses, "ledger should have a no-route row"
-        assert "settled" in ledger_statuses or True, "ledger should have a settled row (or none in dry-run mock)"
+        assert "settled" in ledger_statuses, "ledger should have a settled row"
+
+        # Verify Act 3 contains all required event kinds (OP request/response pairs and GNAP grant flow)
+        act3_kinds = {e["kind"] for e in act_3["events"]}
+        required_kinds = {"op_request", "op_response", "grant_request", "grant_interaction", "grant_approval", "grant_response"}
+        assert required_kinds <= act3_kinds, f"Act 3 missing required event kinds. Expected {required_kinds}, got {act3_kinds}"
 
         # Check void_principle
         assert "void_principle" in doc, "Missing void_principle"

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""U3 End-to-End Demo: settlement intent → settler → ledger with event-log emission.
+"""U3 End-to-End Demo: 3-act purchase model with settlement via Open Payments.
 
-Demonstrates the complete flow with optional event-log capture for HTML replay.
+Three-act narrative:
+- Act 1: User A deposits the original (no wallet → no-route, fully credited)
+- Act 2: User B remixes it (has wallet, but no settlement yet)
+- Act 3: User C purchases the remix → triggers settlement flow for B via Open Payments
+
+Event-log emission (schema 1.2) captures the entire flow.
 
 Usage:
-  # Dry-run with mock images:
+  # Dry-run with synthetic events:
   python demo/run_demo.py --dry-run --emit-json /tmp/capture.json
 
-  # Live capture against testnet (requires real images and wallets):
+  # Live capture against testnet (requires real images, wallets config):
   python demo/run_demo.py --images original.png remix.png --wallets wallets.json --emit-json /tmp/capture.json
 
 Environment setup (from U0):
@@ -77,13 +82,17 @@ def load_wallets_config(wallets_file: Path) -> dict:
 
     Expected schema:
     {
-      "source_wallet": "https://wallet.interledger-test.dev/zephyr-settler-source",
+      "source_wallet": "https://ilp.interledger-test.dev/user_c",
       "wallets": {
-        "contributor_01": "https://wallet.interledger-test.dev/contributor_01",
+        "user_a": null,  // no wallet
+        "user_b": "https://ilp.interledger-test.dev/user_b",
+        "user_c": "https://ilp.interledger-test.dev/user_c",
         ...
       }
     }
     """
+    if not wallets_file.exists():
+        return None
     config = json.loads(wallets_file.read_text())
     return config
 
@@ -137,11 +146,11 @@ def run_demo(
     queue_db: Path | None = None,
     ledger_db: Path | None = None,
 ) -> dict:
-    """Run the end-to-end demo.
+    """Run the end-to-end 3-act demo.
 
     Args:
         demo_env: Environment dict from load_demo_env()
-        dry_run: If True, skip actual OP calls (mock them)
+        dry_run: If True, skip actual OP calls (mock them with synthetic events)
         image_paths: List of image file paths [original, remix] for real sha256
         wallets_config: Wallet configuration dict (loaded from --wallets)
         emit_json_path: Path to write event-log JSON
@@ -151,7 +160,7 @@ def run_demo(
 
     Returns dict with demo results.
     """
-    log.info("=== U3 End-to-End Demo ===")
+    log.info("=== U3 End-to-End Demo (3-Act Model) ===")
 
     # Set up temporary DBs if not provided
     tmp_dir = None
@@ -181,15 +190,19 @@ def run_demo(
     keys_dir = Path(demo_env["ZEPHYR_DEMO_KEYS_DIR"])
     contributors = demo_env.get("contributors") or json.loads(demo_env["ZEPHYR_DEMO_CONTRIBUTORS"])
 
+    # Ensure we have at least 3 contributors for the 3-act model
+    if len(contributors) < 3:
+        log.warning("Expected 3+ contributors for 3-act model, got %d", len(contributors))
+
     # Compute manifest hashes (real or mock)
     if image_paths and len(image_paths) >= 2:
         manifest_original = compute_manifest_hash(image_paths[0])
         manifest_remix = compute_manifest_hash(image_paths[1])
-        capture_mode = "live-testnet-a1"
+        capture_mode = "live-testnet"
     else:
         # Dry-run with deterministic placeholder hashes
-        manifest_original = "sha256:demo-original-smiley-placeholder"
-        manifest_remix = "sha256:demo-remix-smiley-hat-placeholder"
+        manifest_original = "sha256:90071b6020ba2c70fb3c97d4e19bb655d836537ad9ac2f133ce4768fa3ef2ef7"
+        manifest_remix = "sha256:9ebd0fd52e5cf445a66805cd97fe6bfd59cb34eb4a57c0f19f42e831aef59598"
         capture_mode = "captured-mock"
 
     # Initialize event-log if requested
@@ -197,16 +210,17 @@ def run_demo(
     if emit_json_path:
         source_wallet = wallets_config.get("source_wallet") if wallets_config else demo_env["ZEPHYR_SETTLER_SOURCE_WALLET"]
         captured_run = CapturedRun(
-            run_id="run-demo",
+            run_id="run-3act-demo",
             mode=capture_mode,
             network="interledger-test.dev",
             settler_source_wallet=source_wallet,
+            inter_scene_gap_ms=2200,
         )
-        captured_run.add_actor("contributor", "Contributor", "entity", "the human/agent who made the work")
+        captured_run.add_actor("user", "User", "entity", "the human/agent acting")
         captured_run.add_actor("settler", "Settler", "entity", "Zephyr")
         captured_run.add_actor("rafiki", "Rafiki", "responder", "Open Payments · interledger-test.dev")
-        captured_run.add_artifact("original", "smiley.png", "image/png", manifest_original, "original — a smiley face")
-        captured_run.add_artifact("remix", "smiley-hat.png", "image/png", manifest_remix, "remix — smiley with hat", derived_from=manifest_original)
+        captured_run.add_artifact("smiley", "smiley.png", "image/png", manifest_original, "original")
+        captured_run.add_artifact("hat-remix", "smiley-hat.png", "image/png", manifest_remix, "remix — original + hat", derived_from=manifest_original)
 
     results = {
         "contributors": [],
@@ -214,51 +228,146 @@ def run_demo(
         "no_route": [],
     }
 
-    # Scene 1: Original creator (no wallet, no-route)
-    log.info("\n--- Scene 1: Original Creator (NO WALLET) ---")
-    contrib_original = contributors[0]
-    key_file_orig = keys_dir / f"{contrib_original['name']}.pem"
+    # Get contributors for each role
+    contrib_a = contributors[0]  # Original (no wallet)
+    contrib_b = contributors[1] if len(contributors) > 1 else contributors[0]  # Remixer (has wallet)
+    contrib_c = contributors[2] if len(contributors) > 2 else contributors[-1]  # Purchaser (has wallet)
 
-    if not key_file_orig.exists():
-        raise FileNotFoundError(f"Key file not found: {key_file_orig}")
+    # ========================================================================
+    # ACT 1: Original Creator deposits (no wallet → no-route)
+    # ========================================================================
+    log.info("\n--- Act 1: Original Creator (NO WALLET) ---")
 
-    signer_orig = AgentSigner(key_file_orig)
-    pubkey_id_orig = contrib_original["pubkey_id"]
-    prov_orig = make_signed_deposit(attr_log, signer_orig, contrib_original["name"], manifest_original, pubkey_id_orig, registry=registry)
+    key_file_a = keys_dir / f"{contrib_a['name']}.pem"
+    if not key_file_a.exists():
+        raise FileNotFoundError(f"Key file not found: {key_file_a}")
+
+    signer_a = AgentSigner(key_file_a)
+    pubkey_id_a = contrib_a["pubkey_id"]
+    prov_a = make_signed_deposit(attr_log, signer_a, contrib_a["name"], manifest_original, pubkey_id_a, registry=registry)
     results["contributors"].append({
-        "name": contrib_original["name"],
+        "name": contrib_a["name"],
         "manifest_hash": manifest_original,
         "has_wallet": False,
+        "role": "depositor",
     })
 
     if captured_run:
-        scene_log = captured_run.start_scene("scene-1-original-no-wallet")
-        scene_log.set_title("An original, with no wallet")
+        scene_log = captured_run.start_scene("act-1-deposit")
+        scene_log.set_title("User A deposits the original")
+        scene_log.set_outcome("attributed")
         scene_log.set_contributor(
-            f"agent:{contrib_original['name']}",
-            contrib_original["name"],
+            f"agent:{contrib_a['name']}",
+            "User A",
             has_wallet=False,
+            role="depositor",
         )
-        scene_log.emit("contributor", "settler", "deposit", "signs the original", {
-            "artifact": "original",
-            "manifest_hash": manifest_original,
-            "signature": prov_orig["signature"][:20] + "…",
-            "pubkey_id": pubkey_id_orig,
+        scene_log.emit("user", "settler", "deposit", "A signs & deposits the original", {
+            "artifact": "smiley",
+            "manifest_hash": manifest_original[:20] + "…",
+            "signature": prov_a["signature"][:20] + "…",
+            "note": "Zephyr records the hash, never the image bytes",
         }, t=0)
-        scene_log.emit("settler", "settler", "route", "resolve wallet ✗", {
-            "resolved": False,
-            "reason": "no wallet linked for this pubkey",
-        }, t=500)
-        scene_log.emit("settler", "settler", "ledger", "record no-route", {
-            "status": "no-route",
-            "amount": None,
-            "asset_code": "USD",
-            "attribution": "fully credited",
-            "record": "permanent, portable, undiminished — the record stands",
-        }, t=1000)
+        scene_log.emit("settler", "settler", "attribution", "attribution established", {
+            "attributed_to": "User A",
+            "manifest_hash": manifest_original[:20] + "…",
+            "note": "the record stands — no money moves on a deposit",
+        }, t=550)
 
-    # Settler processes scene 1
-    log.info("\n--- Scene 1 Settlement ---")
+    # ========================================================================
+    # ACT 2: Remixer deposits derived_from original (has wallet, but no settlement yet)
+    # ========================================================================
+    log.info("\n--- Act 2: Remixer (WITH WALLET, NO SETTLEMENT YET) ---")
+
+    key_file_b = keys_dir / f"{contrib_b['name']}.pem"
+    if not key_file_b.exists():
+        raise FileNotFoundError(f"Key file not found: {key_file_b}")
+
+    signer_b = AgentSigner(key_file_b)
+    pubkey_id_b = contrib_b["pubkey_id"]
+    prov_b = make_signed_deposit(attr_log, signer_b, contrib_b["name"], manifest_remix, pubkey_id_b, derived_from=manifest_original, registry=registry)
+    results["contributors"].append({
+        "name": contrib_b["name"],
+        "manifest_hash": manifest_remix,
+        "has_wallet": True,
+        "role": "remixer",
+    })
+
+    if captured_run:
+        scene_log = captured_run.start_scene("act-2-remix")
+        scene_log.set_title("User B remixes it")
+        scene_log.set_outcome("attributed")
+        scene_log.set_contributor(
+            f"agent:{contrib_b['name']}",
+            "User B",
+            has_wallet=True,
+            role="remixer",
+        )
+        scene_log.emit("user", "settler", "deposit", "B signs & deposits the remix", {
+            "artifact": "hat-remix",
+            "manifest_hash": manifest_remix[:20] + "…",
+            "derived_from": manifest_original[:20] + "…",
+            "signature": prov_b["signature"][:20] + "…",
+            "note": "signed derived_from claim",
+        }, t=0)
+        scene_log.emit("settler", "settler", "lineage", "attribution travels", {
+            "derived_from": manifest_original[:20] + "…",
+            "from_user": "User A",
+            "note": "B's remix links back to A's original — and gets its own hash",
+        }, t=550)
+        scene_log.emit("settler", "settler", "attribution", "attribution established", {
+            "attributed_to": "User B",
+            "manifest_hash": manifest_remix[:20] + "…",
+            "note": "still no money — attribution only",
+        }, t=1100)
+
+    # ========================================================================
+    # ACT 3: Purchaser triggers settlement (real OP flow)
+    # ========================================================================
+    log.info("\n--- Act 3: Purchaser (triggers settlement) ---")
+
+    key_file_c = keys_dir / f"{contrib_c['name']}.pem"
+    if not key_file_c.exists():
+        # If there are only 2 contributors, reuse B as the purchaser
+        key_file_c = key_file_b
+        contrib_c = contrib_b
+
+    # Act 3 doesn't create a new deposit; it's a purchase event that triggers settlement
+    # of the remix (manifest_remix) that was created in Act 2
+
+    if captured_run:
+        scene_log = captured_run.start_scene("act-3-purchase")
+        scene_log.set_title("User C buys the remix — money moves")
+        scene_log.set_outcome("settled")  # Act 3 is the settlement act
+        scene_log.set_contributor(
+            f"agent:{contrib_c['name']}",
+            "User C",
+            has_wallet=True,
+            role="purchaser",
+        )
+        scene_log.emit("user", "settler", "purchase", "C purchases the hat product", {
+            "artifact": "hat-remix",
+            "manifest_hash": manifest_remix[:20] + "…",
+            "note": "a real purchase is the occasion for value to move",
+        }, t=0)
+        scene_log.emit("settler", "settler", "chain", "walk the attribution chain", {
+            "chain": ["User B — hat-remix", "User A — original (derived_from)"],
+            "note": "both are attributed",
+        }, t=550)
+        scene_log.emit("settler", "settler", "policy", "void SplitPolicy", {
+            "policy": "VOID",
+            "asserts": "no claim on the correct share between User A and User B",
+        }, t=1100)
+        scene_log.emit("settler", "settler", "route", "who has a wallet at transaction time?", {
+            "User B": "wallet ✓ — will receive",
+            "User A": "no wallet ✗ — credited, unpaid",
+        }, t=1650)
+
+    # Settlement intents are automatically enqueued when deposits are recorded
+    log.info("\n--- Settlement Phase ---")
+    log.info("Settlement intents for signed deposits are auto-enqueued by attribution.record()")
+
+    # Run settler
     settler = Settler(
         source_wallet=demo_env["ZEPHYR_SETTLER_SOURCE_WALLET"],
         intent_queue=intent_queue,
@@ -268,225 +377,130 @@ def run_demo(
     )
 
     if dry_run:
-        log.info("DRY RUN: Mocking OP flow")
-        with patch.object(settler, "_execute_op_flow") as mock_op:
-            mock_op.return_value = "op-demo-orig-1234"
-            settler.drain(limit=10)
-    else:
-        log.info("Running settler (may fail if testnet unreachable)")
-        settler.drain(limit=10)
-
-    ledger_orig = ledger.get(manifest_original)
-    if ledger_orig and ledger_orig["status"] == "no-route":
-        log.info("✓ Original marked no-route (as expected)")
-        results["no_route"].append(contrib_original["name"])
-        if captured_run:
-            captured_run.add_ledger_row(
-                contrib_original["name"],
-                "original",
-                "no-route",
-                None,
-                "USD",
-                None,
-                "fully credited",
-                record="the record stands",
-            )
-    elif ledger_orig and ledger_orig["status"] == "settled":
-        log.warning("! Original settled (unexpected; has no wallet)")
-        results["settled"].append(contrib_original["name"])
-    else:
-        log.warning("! Original not in ledger")
-
-    # Scene 2: Remixer (has wallet, settles)
-    log.info("\n--- Scene 2: Remixer (WITH WALLET) ---")
-    contrib_remix = contributors[1] if len(contributors) > 1 else contributors[-1]
-    key_file_remix = keys_dir / f"{contrib_remix['name']}.pem"
-
-    if not key_file_remix.exists():
-        raise FileNotFoundError(f"Key file not found: {key_file_remix}")
-
-    signer_remix = AgentSigner(key_file_remix)
-    pubkey_id_remix = contrib_remix["pubkey_id"]
-    prov_remix = make_signed_deposit(attr_log, signer_remix, contrib_remix["name"], manifest_remix, pubkey_id_remix, derived_from=manifest_original, registry=registry)
-    results["contributors"].append({
-        "name": contrib_remix["name"],
-        "manifest_hash": manifest_remix,
-        "has_wallet": True,
-    })
-
-    if captured_run:
-        scene_log = captured_run.start_scene("scene-2-remix-settles")
-        scene_log.set_title("A remix that builds on it, with a wallet")
-        scene_log.set_contributor(
-            f"agent:{contrib_remix['name']}",
-            contrib_remix["name"],
-            has_wallet=True,
-        )
-        scene_log.emit("contributor", "settler", "deposit", "signs the remix", {
-            "artifact": "remix",
-            "manifest_hash": manifest_remix,
-            "derived_from": manifest_original,
-            "signature": prov_remix["signature"][:20] + "…",
-            "pubkey_id": pubkey_id_remix,
-        }, t=0)
-        scene_log.emit("settler", "settler", "lineage", "attribution travels", {
-            "derived_from": manifest_original,
-            "from_contributor": contrib_original["name"],
-        }, t=500)
-        scene_log.emit("settler", "settler", "policy", "void SplitPolicy", {
-            "policy": "VOID",
-            "asserts": "no claim on the correct share between original and remix",
-        }, t=1000)
-        scene_log.emit("settler", "settler", "route", "resolve wallet ✓", {
-            "resolved": True,
-            "wallet": wallet_map.resolve(pubkey_id_remix) or f"https://wallet.interledger-test.dev/{contrib_remix['name'].lower()}",
-        }, t=1500)
-
-    # Settler processes scene 2
-    log.info("\n--- Scene 2 Settlement ---")
-    if dry_run:
         log.info("DRY RUN: Mocking OP flow with synthetic events")
         with patch.object(settler, "_execute_op_flow") as mock_op:
             mock_op.return_value = "op-demo-remix-5678"
 
-            # If capturing events, emit synthetic OP/GNAP handshake for scene 2
+            # Emit synthetic OP/GNAP handshake for Act 3 if capturing
             if captured_run:
-                scene_log = captured_run.scene_logs[-1]  # Get scene 2's log
+                scene_log = captured_run.scene_logs[-1]  # Get Act 3's log
 
-                # Emit synthetic incoming payment request/response
+                # Incoming payment request/response
                 scene_log.emit("settler", "rafiki", "op_request", "POST /incoming-payments", {
                     "method": "POST",
-                    "url": f"{wallet_map.resolve(pubkey_id_remix)}/incoming-payments",
-                    "body": {
-                        "incomingAmount": {
-                            "value": "1",
-                            "assetCode": "USD",
-                            "assetScale": 2,
-                        }
-                    }
-                }, t=1900)
+                    "url": f"https://ilp.interledger-test.dev/zephyr_userb/incoming-payments",
+                    "body": {"incomingAmount": {"value": "1", "assetCode": "USD", "assetScale": 2}},
+                }, t=2200)
 
                 scene_log.emit("rafiki", "settler", "op_response", "201 incoming payment", {
                     "status": 201,
-                    "body": {
-                        "id": "https://wallet.interledger-test.dev/incoming-payments/ip_synthetic",
-                        "walletAddress": wallet_map.resolve(pubkey_id_remix),
-                    }
-                }, t=2300)
+                    "body": {"id": "ip_9f3a2b", "walletAddress": "https://ilp.interledger-test.dev/zephyr_userb"},
+                }, t=2650)
 
-                # Emit synthetic quote request/response
+                # Quote request/response
                 scene_log.emit("settler", "rafiki", "op_request", "POST /quotes", {
                     "method": "POST",
-                    "url": f"{demo_env['ZEPHYR_SETTLER_SOURCE_WALLET']}/quotes",
-                    "body": {
-                        "receiver": "ip_synthetic",
-                        "method": "ilp",
-                    }
-                }, t=2700)
-
-                scene_log.emit("rafiki", "settler", "op_response", "201 quote", {
-                    "status": 201,
-                    "body": {
-                        "id": "qt_synthetic",
-                        "sendAmount": {"value": "1", "assetCode": "USD", "assetScale": 2},
-                        "receiveAmount": {"value": "1", "assetCode": "USD", "assetScale": 2},
-                    }
+                    "url": "https://ilp.interledger-test.dev/zephyr_userc/quotes",
+                    "body": {"receiver": "ip_9f3a2b", "method": "ilp"},
                 }, t=3100)
 
-                # Emit synthetic GNAP grant request/response with interact
+                scene_log.emit("rafiki", "settler", "op_response", "201 quote — $0.01", {
+                    "status": 201,
+                    "body": {"id": "qt_4c7e", "receiveAmount": {"value": "1", "assetCode": "USD", "assetScale": 2}},
+                }, t=3550)
+
+                # GNAP grant request/response
                 scene_log.emit("settler", "rafiki", "grant_request", "POST /grant (GNAP)", {
                     "method": "POST",
                     "url": "https://auth.interledger-test.dev/",
-                    "body": {
-                        "access_token": {
-                            "access": [{"type": "outgoing-payment", "actions": ["create", "read"]}]
-                        },
-                        "client": "zephyr-settler",
-                    }
-                }, t=3500)
+                    "body": {"access_token": {"access": [{"type": "outgoing-payment", "actions": ["create", "read"]}]}},
+                }, t=4000)
 
                 scene_log.emit("rafiki", "settler", "grant_interaction", "interact required", {
                     "status": 200,
-                    "interact": {
-                        "redirect": "https://wallet.interledger-test.dev/interact/gr_synthetic/approve",
-                        "finish": "gr_synthetic_finish",
-                    },
-                    "human_note": "outgoing-payment grant needs one-time approval in the wallet UI (real Rafiki returns 200 with an interact block, not 401)",
-                }, t=3900)
+                    "interact": {"redirect": "https://wallet.interledger-test.dev/interact/gr_a1b2/approve"},
+                    "human_note": "the purchaser (User C) approves the outgoing payment once",
+                }, t=4450)
 
-                scene_log.emit("contributor", "rafiki", "grant_approval", "human approves grant", {
+                scene_log.emit("user", "rafiki", "grant_approval", "C approves the payment", {
                     "approved": True,
-                    "approve_url": "https://wallet.interledger-test.dev/interact/gr_synthetic/approve",
-                    "note": "captured once; demonstrates the Open Payments consent model",
-                }, t=4400)
+                    "note": "captured once — the Open Payments consent moment",
+                }, t=5000)
 
                 scene_log.emit("rafiki", "settler", "grant_response", "access_token granted", {
                     "status": 200,
-                    "body": {
-                        "access_token": {
-                            "value": "gr_synthetic…",
-                            "manage": "https://auth.interledger-test.dev/token/…",
-                        }
-                    }
-                }, t=4900)
+                    "body": {"access_token": {"value": "gr_a1b2…"}},
+                }, t=5550)
 
-                # Emit synthetic outgoing payment request/response
+                # Outgoing payment request/response
                 scene_log.emit("settler", "rafiki", "op_request", "POST /outgoing-payments", {
                     "method": "POST",
-                    "url": f"{demo_env['ZEPHYR_SETTLER_SOURCE_WALLET']}/outgoing-payments",
-                    "body": {"quoteId": "qt_synthetic"}
-                }, t=5300)
+                    "url": "https://ilp.interledger-test.dev/zephyr_userc/outgoing-payments",
+                    "body": {"quoteId": "qt_4c7e"},
+                }, t=6000)
 
-                scene_log.emit("rafiki", "settler", "op_response", "201 state: completed", {
+                scene_log.emit("rafiki", "settler", "op_response", "201 state: COMPLETED", {
                     "status": 201,
-                    "body": {
-                        "id": "op-demo-remix-5678",
-                        "state": "COMPLETED",
-                        "sentAmount": {"value": "1", "assetCode": "USD", "assetScale": 2},
-                    }
-                }, t=5700)
+                    "body": {"id": "op_7e1d", "state": "COMPLETED", "sentAmount": {"value": "1", "assetCode": "USD", "assetScale": 2}},
+                }, t=6450)
+
+                # Ledger records
+                scene_log.emit("settler", "settler", "ledger", "record settled — User B", {
+                    "user": "User B",
+                    "status": "settled",
+                    "amount": 1,
+                    "asset_code": "USD",
+                    "op_payment_id": "op_7e1d",
+                    "attribution": "fully credited",
+                }, t=7000)
+
+                scene_log.emit("settler", "settler", "ledger", "record no-route — User A", {
+                    "user": "User A",
+                    "status": "no-route",
+                    "amount": None,
+                    "asset_code": "USD",
+                    "attribution": "fully credited",
+                    "record": "the record stands",
+                }, t=7550)
 
             settler.drain(limit=10)
     else:
-        log.info("Running settler for remix (may require approval)")
+        log.info("Running settler (may require approval)")
         settler.drain(limit=10)
 
+    # Check results
     ledger_remix = ledger.get(manifest_remix)
-    if captured_run:
-        scene_log = captured_run.scene_logs[-1]  # Get scene 2's log
     if ledger_remix and ledger_remix["status"] == "settled":
         log.info("✓ Remix settled: %s", ledger_remix["op_payment_id"])
-        results["settled"].append(contrib_remix["name"])
+        results["settled"].append(contrib_b["name"])
         if captured_run:
-            scene_log.emit("settler", "settler", "ledger", "record settled ✓", {
-                "status": "settled",
-                "amount": 1,
-                "asset_code": "USD",
-                "op_payment_id": ledger_remix["op_payment_id"],
-                "attribution": "fully credited",
-            }, t=6100)
+            scene_log = captured_run.scene_logs[-1]  # Get Act 3's log
             captured_run.add_ledger_row(
-                contrib_remix["name"],
-                "remix",
+                "User B",
+                "hat-remix",
                 "settled",
                 1,
                 "USD",
                 ledger_remix["op_payment_id"],
                 "fully credited",
-                derived_from=contrib_original["name"],
+                derived_from="User A",
             )
-    elif ledger_remix and ledger_remix["status"] == "no-route":
-        log.warning("! Remix marked no-route (unexpected; has wallet)")
-        results["no_route"].append(contrib_remix["name"])
-        if captured_run:
-            scene_log.emit("settler", "settler", "ledger", "record no-route", {
-                "status": "no-route",
-                "amount": None,
-                "asset_code": "USD",
-                "attribution": "fully credited",
-            }, t=6100)
     else:
-        log.warning("! Remix not in ledger (settlement may have failed)")
+        log.warning("! Remix not settled (may have failed)")
+
+    # Record no-route for original
+    results["no_route"].append(contrib_a["name"])
+    if captured_run:
+        captured_run.add_ledger_row(
+            "User A",
+            "smiley",
+            "no-route",
+            None,
+            "USD",
+            None,
+            "fully credited",
+            record="the record stands",
+        )
 
     # Display ledger
     log.info("\n--- Settlement Ledger ---")
@@ -503,23 +517,22 @@ def run_demo(
     print("=" * 80)
     print()
 
+    # Build mapping from pubkey_id to contributor display names
+    contrib_map = {contrib["pubkey_id"]: contrib["name"] for contrib in contributors}
+
     rows = ledger.all()
-    print(f"{'Contributor':<20} {'Status':<12} {'Amount':<10} {'Attribution':<20}")
+    print(f"{'User':<20} {'Status':<12} {'Amount':<10} {'Attribution':<20}")
     print("-" * 65)
 
     for row in rows:
-        pubkey_id = row["pubkey_id"][:18]
+        pubkey_id = row["pubkey_id"]
         status = row["status"]
         amount_str = "—" if status == "no-route" or not row["amount"] else f"${row['amount'] / 100:.2f}"
-        contrib_name = "unknown"
-        for c in contributors:
-            if c["pubkey_id"] == row["pubkey_id"]:
-                contrib_name = c["name"]
-                break
-        print(f"{contrib_name:<20} {status:<12} {amount_str:<10} fully credited")
+        user_name = contrib_map.get(pubkey_id, f"Unknown ({pubkey_id[:18]})")
+        print(f"{user_name:<20} {status:<12} {amount_str:<10} fully credited")
 
     print()
-    print(f"Total: {len(rows)} contributors (all credited)")
+    print(f"Total: {len(rows)} users")
     print(f"  Settled: {sum(1 for r in rows if r['status'] == 'settled')}")
     print(f"  No-route (undiminished): {sum(1 for r in rows if r['status'] == 'no-route')}")
     print()
@@ -528,8 +541,8 @@ def run_demo(
     if captured_run:
         captured_run.void_principle = {
             "policy": "VOID",
-            "statement": "SplitPolicy VOID — this system makes no claim about the correct share between the original and the remix.",
-            "record_not_money": "No wallet, no payment — and no retroactive backfill. Zephyr guarantees the RECORD — permanent, portable, undiminished — never deferred money.",
+            "statement": "SplitPolicy VOID — Zephyr makes no claim about the correct share between User A and User B.",
+            "record_not_money": "Money routes only to attributed creators who have a wallet linked at transaction time. User A has none, so User A is credited but unpaid — and there is no retroactive backfill. Zephyr guarantees the RECORD, never deferred money.",
             "coda": "The livelihood gap is the unsolved problem.",
         }
         captured_run.write_json(emit_json_path)
@@ -540,12 +553,12 @@ def run_demo(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="U3 end-to-end demo: settlement intent → settler → ledger"
+        description="U3 3-act demo: original → remix → purchase → settlement"
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Skip actual Open Payments calls (mock them)",
+        help="Skip actual Open Payments calls (mock them with synthetic events)",
     )
     parser.add_argument(
         "--images",
