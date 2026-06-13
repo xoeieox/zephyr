@@ -93,12 +93,14 @@ def test_u2_ac1_gnap_pre_auth_grant_request():
         mock_httpx.Client.return_value = mock_client
 
         mock_response = MagicMock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "access_token": {
                 "value": "test-token-value",
                 "flags": ["bearer"],
             }
         }
+        mock_response.raise_for_status.return_value = None
         mock_client.post.return_value = mock_response
 
         gnap = GNAPClient("https://auth.interledger-test.dev")
@@ -121,12 +123,14 @@ def test_u2_ac1_gnap_continue_grant():
         mock_httpx.Client.return_value = mock_client
 
         mock_response = MagicMock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "access_token": {
                 "value": "final-token",
                 "flags": ["bearer"],
             }
         }
+        mock_response.raise_for_status.return_value = None
         mock_client.post.return_value = mock_response
 
         gnap = GNAPClient("https://auth.interledger-test.dev")
@@ -147,10 +151,12 @@ def test_u2_ac2_op_client_create_incoming_payment():
         mock_httpx.Client.return_value = mock_client
 
         mock_response = MagicMock()
+        mock_response.status_code = 201
         mock_response.json.return_value = {
             "id": "incoming-payment-123",
             "walletAddress": "https://wallet.interledger-test.dev/alice",
         }
+        mock_response.raise_for_status.return_value = None
         mock_client.post.return_value = mock_response
 
         op = OPClient()
@@ -169,12 +175,13 @@ def test_u2_ac2_op_client_request_quote():
         mock_httpx.Client.return_value = mock_client
 
         mock_response = MagicMock()
+        mock_response.status_code = 201
         mock_response.json.return_value = {
+            "id": "quote-123",
             "sendAmount": {"value": "1", "assetCode": "USD", "assetScale": 2},
             "receiveAmount": {"value": "1", "assetCode": "USD", "assetScale": 2},
-            "ilpAddress": "g.rafiki.alice",
-            "ilpPacket": "packet-data-here",
         }
+        mock_response.raise_for_status.return_value = None
         mock_client.post.return_value = mock_response
 
         op = OPClient()
@@ -182,10 +189,9 @@ def test_u2_ac2_op_client_request_quote():
             "https://wallet.interledger-test.dev/alice",
             "incoming-payment-123",
             "test-bearer-token",
-            {"value": "1", "assetCode": "USD", "assetScale": 2},
         )
 
-        assert result["ilpAddress"] == "g.rafiki.alice"
+        assert result["id"] == "quote-123"
 
 
 def test_u2_ac2_op_client_create_outgoing_payment():
@@ -195,19 +201,19 @@ def test_u2_ac2_op_client_create_outgoing_payment():
         mock_httpx.Client.return_value = mock_client
 
         mock_response = MagicMock()
+        mock_response.status_code = 201
         mock_response.json.return_value = {
             "id": "outgoing-payment-456",
-            "state": "pending",
+            "state": "COMPLETED",
         }
+        mock_response.raise_for_status.return_value = None
         mock_client.post.return_value = mock_response
 
         op = OPClient()
         result = op.create_outgoing_payment(
             "https://wallet.interledger-test.dev/settler",
             "test-bearer-token",
-            receive_amount={"value": "1", "assetCode": "USD", "assetScale": 2},
-            ilp_address="g.rafiki.alice",
-            ilp_packet="packet-data-here",
+            quote_id="quote-123",
         )
 
         assert result["id"] == "outgoing-payment-456"

@@ -175,6 +175,23 @@ class Settler:
                 },
             )
 
+            # Check for interactive grant flow (real Rafiki returns 200 with interact block)
+            if "interact" in grant_resp:
+                interact_info = grant_resp.get("interact", {})
+                approval_url = interact_info.get("redirect")
+                continue_token = grant_resp.get("continue", {}).get("access_token")
+
+                if approval_url:
+                    log.info("GNAP interaction required: %s", approval_url)
+                    if not continue_token:
+                        raise RuntimeError("No continuation token provided in grant response")
+
+                    # Prompt operator for approval (stdin for captured mode)
+                    input(f"Please approve at: {approval_url}\nPress Enter to continue after approval...")
+
+                    # Continue the grant with the continuation token
+                    grant_resp = gnap.continue_grant(continue_token)
+
             if "access_token" not in grant_resp:
                 raise RuntimeError(f"No access_token in grant response: {grant_resp}")
 
@@ -185,25 +202,17 @@ class Settler:
             incoming_payment_id = incoming["id"]
 
             # Request quote
-            send_amount = {
-                "value": str(amount),
-                "assetCode": asset_code,
-                "assetScale": 2,
-            }
             quote = op_client.request_quote(
                 recipient_wallet,
                 incoming_payment_id,
                 token,
-                send_amount,
             )
 
             # Create outgoing payment from source
             outgoing = op_client.create_outgoing_payment(
                 self.source_wallet,
                 token,
-                receive_amount=quote.get("receiveAmount", send_amount),
-                ilp_address=quote.get("ilpAddress", ""),
-                ilp_packet=quote.get("ilpPacket", ""),
+                quote_id=quote.get("id"),
             )
 
             return outgoing["id"]

@@ -60,24 +60,24 @@ class TestU0FixtureSetup:
 
         # Verify contents
         contributors = result["contributors"]
-        assert len(wallet_map) == 2, "WalletMap should have 2 entries (3rd excluded)"
+        assert len(wallet_map) == 2, "WalletMap should have 2 entries (first excluded)"
 
-        # First two contributors should be in wallet map
-        for i in range(2):
+        # Last two contributors should be in wallet map
+        for i in range(1, 3):
             pubkey_id = contributors[i]["pubkey_id"]
             assert pubkey_id in wallet_map, f"Contributor {i} not in wallet map"
             assert wallet_map[pubkey_id].startswith(
                 "https://wallet.interledger-test.dev/"
             ), "Wallet address format incorrect"
 
-        # Third contributor (no_wallet=True) should NOT be in wallet map
-        pubkey_id_3 = contributors[2]["pubkey_id"]
+        # First contributor (no_wallet=True) should NOT be in wallet map
+        pubkey_id_0 = contributors[0]["pubkey_id"]
         assert (
-            pubkey_id_3 not in wallet_map
-        ), "Contributor 3 should not be in wallet map (no-route demo)"
+            pubkey_id_0 not in wallet_map
+        ), "Contributor 0 should not be in wallet map (no-route demo)"
 
     def test_one_contributor_without_wallet(self, tmp_path):
-        """Last contributor deliberately has no wallet (no-route demo)."""
+        """First contributor deliberately has no wallet (original, no-route demo)."""
         keys_dir = tmp_path / "keys"
         wallet_map_path = tmp_path / "wallet_map.json"
 
@@ -89,11 +89,11 @@ class TestU0FixtureSetup:
 
         contributors = result["contributors"]
 
-        # Last contributor should have no_wallet=True
-        assert contributors[-1]["no_wallet"] is True, "Last contributor should have no_wallet=True"
+        # First contributor should have no_wallet=True
+        assert contributors[0]["no_wallet"] is True, "First contributor should have no_wallet=True"
 
-        # First two should have no_wallet=False
-        for i in range(2):
+        # Last two should have no_wallet=False
+        for i in range(1, 3):
             assert (
                 contributors[i]["no_wallet"] is False
             ), f"Contributor {i} should have no_wallet=False"
@@ -172,11 +172,11 @@ class TestU0FixtureSetup:
         contributors = result["contributors"]
         assert len(contributors) == 5, "Should create 5 contributors"
 
-        # Last one has no wallet
-        assert contributors[-1]["no_wallet"] is True
+        # First one has no wallet
+        assert contributors[0]["no_wallet"] is True
 
         # Others have wallets
-        for i in range(4):
+        for i in range(1, 5):
             assert contributors[i]["no_wallet"] is False
 
     def test_idempotent_full_setup(self, tmp_path):

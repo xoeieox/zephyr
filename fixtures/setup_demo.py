@@ -264,8 +264,8 @@ def setup_demo(
     for i in range(num_contributors):
         name = f"contributor_{i+1:02d}"
         pubkey_id, public_bytes = create_or_load_contributor_key(name, keys_dir)
-        # Last contributor has no wallet (demonstrates no-route)
-        no_wallet = i == num_contributors - 1
+        # First contributor has no wallet (original, no-route demo)
+        no_wallet = i == 0
         contrib = {"name": name, "pubkey_id": pubkey_id, "no_wallet": no_wallet}
         contributors.append(contrib)
         log.info(
@@ -363,7 +363,7 @@ def main():
         # Print summary
         print(f"\n✓ U0 Demo Setup Complete")
         print(f"  Contributors: {args.num_contributors}")
-        print(f"    - Last contributor ({result['contributors'][-1]['name']}) has no wallet (no-route demo)")
+        print(f"    - First contributor ({result['contributors'][0]['name']}) has no wallet (original, no-route demo)")
         print(f"  Wallet map: {args.wallet_map}")
         print(f"  Keys dir: {args.keys_dir}")
         if args.output_env:
