@@ -397,6 +397,25 @@ class AttributionLog:
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) AS n FROM deposits").fetchone()["n"]
 
+    def list_by_store_kind_and_key(self, store_kind: str, key: str) -> list[dict]:
+        """All deposits for (store_kind, key), oldest first. Read-only; no verification.
+
+        The deposit set is the authority on what claims exist for a given
+        (store_kind, target_key) pair (rail U2a, D2) - callers require a
+        claims-store domain row for every row returned here, raising tamper
+        if one is missing, rather than iterating from the domain store (which
+        a deletion can silently shrink). Filters target_key in SQL on top of
+        the existing deposits_store index; a linear scan within one
+        store_kind is acceptable at this scale.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM deposits WHERE store_kind = ? AND target_key = ? "
+                "ORDER BY recorded_at ASC",
+                (store_kind, key),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_by_pubkey(
         self, pubkey_id: str, *, verify: bool = False, registry: "PubkeyRegistry | None" = None
     ) -> dict | None:
