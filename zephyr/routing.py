@@ -1,4 +1,4 @@
-"""Zephyr RouteManifest compiler (rail U1).
+"""Zephyr RouteManifest compiler (rail U1) + executor contract surface (rail U2a).
 
 Compiles a payment event (amount EXOGENOUS - never derived here) into a
 RouteManifest: a signed, deposited claim naming exactly who gets paid what,
@@ -12,17 +12,41 @@ signed, taken as given.
 
 Void Principle: a beneficiary without a wallet is credited-but-unpaid, never
 dropped, never redistributed - the leg stays in the manifest at full amount
-with leg_status="credited-unpaid" and wallet_address=null.
+with leg_status="credited-unpaid" and wallet_address=null. A beneficiary
+whose registered key is later revoked keeps the same allocation and also
+resolves to credited-unpaid (D3) - revocation never redistributes either.
 
 Compile stages (see compile_route_manifest docstring for the strict order).
 This function never moves money - it only ever produces and deposits a
-signed manifest; execution (U2) is a separate, later unit.
+signed manifest; execution (U2b) is a separate, later unit.
+
+Executor contract surface (D4): get_manifest_for_event(), is_current_head(),
+reverify_leg() are the three pure-read helpers U2b builds on - they exist so
+the executor never reimplements head selection, envelope parsing, or per-leg
+re-verification. describe_manifest_chain() is a non-raising human diagnostic
+for a wedged store; wedged-state *recovery* is deliberately out of scope (a
+chain-repair tool is a chain-rewrite tool - see CLAUDE.md).
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+
+from zephyr.claims import RouteChainError
+
+__all__ = [
+    "RouteCompileError",
+    "RouteDepthExceeded",
+    "RouteReplayConflict",
+    "RouteTamperError",
+    "RouteChainError",
+    "compile_route_manifest",
+    "get_manifest_for_event",
+    "is_current_head",
+    "reverify_leg",
+    "describe_manifest_chain",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -58,9 +82,10 @@ class RouteTamperError(RouteCompileError):
     Carries ``failure_mode``, one of the verify_row statuses ('unsigned',
     'invalid', 'unknown_key', 'revoked_key', 'suspect'), or 'hash_mismatch'
     (domain payload does not re-hash to its deposit), 'missing_envelope'
-    (domain row with no attribution.db deposit), or 'missing_domain_row'
-    (deposit with no claims-store row when one is required). Message names
-    the manifest_hash and the failure_mode.
+    (domain row with no attribution.db deposit), 'missing_domain_row'
+    (deposit with no claims-store row when one is required), or 'unknown_key'
+    (a routing_terms beneficiary_pubkey_id absent from the registry - D3).
+    Message names the manifest_hash and the failure_mode.
     """
 
     def __init__(self, message: str, *, failure_mode: str):
@@ -134,6 +159,39 @@ def _allocation_layer(route_manifest: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Deposit-authoritative gather (D2 - "missing_domain_row" tamper detection)
+# ---------------------------------------------------------------------------
+
+
+def _gathered_routing_terms(key: str, *, store, lg) -> list[dict]:
+    """Every routing_terms domain row for target_key=key, with the attribution
+    log's deposit set as authority.
+
+    Iterating from claims-store domain rows made a deleted domain row
+    silently invisible (the deletion attack D2 exists to close): the compile
+    would just drop the leg with no tamper signal, a silent allocation
+    change. Inverted: for every routing_terms DEPOSIT naming this key, a
+    claims-store domain row keyed by that deposit's manifest_hash MUST exist,
+    or RouteTamperError("missing_domain_row") naming the manifest_hash and
+    the key. Revoked-then-superseded deposits still have a domain row (claims
+    are append-only tombstones) and are filtered by scope/integrity bind
+    downstream, not by absence here - absence is always tamper.
+    """
+    deposits = lg.list_by_store_kind_and_key("routing_terms", key)
+    domain_by_hash = {r["manifest_hash"]: r for r in store.list_routing_terms_for_subject(key)}
+    rows = []
+    for dep in deposits:
+        mh = dep["manifest_hash"]
+        domain_row = domain_by_hash.get(mh)
+        if domain_row is None:
+            raise RouteTamperError(
+                f"missing_domain_row: {mh} (subject={key})", failure_mode="missing_domain_row"
+            )
+        rows.append(domain_row)
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # compile_route_manifest
 # ---------------------------------------------------------------------------
 
@@ -161,10 +219,15 @@ def compile_route_manifest(
          changed -> new manifest with supersedes; allocation differs ->
          RouteReplayConflict).
       1. Gather - subject + parent (derived_from) envelopes, direct + parent
-         standing routing_terms from the claims store.
+         standing routing_terms from the claims store (deposit-authoritative,
+         D2: a deposit with no domain row is missing_domain_row tamper).
       2. Verify consumed claims - every routing_terms row is integrity-bound
          (RouteTamperError on failure); subject/parent envelopes must be
          verified (RouteCompileError otherwise).
+      2b. Registry enforcement (D3) - every consumed term's
+          beneficiary_pubkey_id must be registered (unknown_key tamper,
+          fails the whole compile) or revoked (not tamper - the leg keeps
+          its allocation but resolves credited-unpaid in stage 5).
       3. Validate terms - bounds, duplicates, single pass-through hop, 2-hop
          depth cap.
       4. Allocate - exact integer conservation via largest-remainder.
@@ -172,10 +235,7 @@ def compile_route_manifest(
       6. Emit + deposit - record via record_signed.
     """
     from zephyr.attribution import get_recorder, record_signed
-    from zephyr.claims import (
-        get_claims_store,
-        verify_routing_terms_row,
-    )
+    from zephyr.claims import get_claims_store, verify_routing_terms_row
     from zephyr.claims import resolve_wallet as _resolve_wallet
     from zephyr.registry import get_registry
     from zephyr.signing import get_signer
@@ -201,16 +261,10 @@ def compile_route_manifest(
             raise RouteCompileError(f"parent deposit not verified ({status}): {parent_mh}")
 
     event_scope = f"event:{event_ref}"
-    direct_candidate_rows = [
-        r
-        for r in store.list_routing_terms_for_subject(subject)
-        if r["scope"] in ("standing", event_scope)
-    ]
-    parent_standing_candidate_rows = (
-        [r for r in store.list_routing_terms_for_subject(parent_mh) if r["scope"] == "standing"]
-        if parent_mh
-        else []
-    )
+    direct_all_rows = _gathered_routing_terms(subject, store=store, lg=lg)
+    direct_candidate_rows = [r for r in direct_all_rows if r["scope"] in ("standing", event_scope)]
+    parent_all_rows = _gathered_routing_terms(parent_mh, store=store, lg=lg) if parent_mh else []
+    parent_standing_candidate_rows = [r for r in parent_all_rows if r["scope"] == "standing"]
 
     # ---- Stage 2: Verify consumed claims -----------------------------------
 
@@ -227,6 +281,19 @@ def compile_route_manifest(
 
     direct_term_rows = _verified(direct_candidate_rows)
     parent_standing_rows = _verified(parent_standing_candidate_rows)
+
+    # ---- Stage 2b: Registry enforcement (D3) -------------------------------
+
+    revoked_beneficiaries = set()
+    for row in direct_term_rows + parent_standing_rows:
+        bpid = row["beneficiary_pubkey_id"]
+        entry = reg.lookup(bpid)
+        if entry is None:
+            raise RouteTamperError(
+                f"unknown_key: {bpid} ({row['manifest_hash']})", failure_mode="unknown_key"
+            )
+        if entry.get("status") == "revoked":
+            revoked_beneficiaries.add(bpid)
 
     # ---- Stage 3: Validate terms --------------------------------------
 
@@ -337,7 +404,10 @@ def compile_route_manifest(
 
     final_legs = []
     for leg in legs:
-        wallet_address = _resolve_wallet(leg["beneficiary_pubkey_id"], store=store, log=lg, registry=reg)
+        if leg["beneficiary_pubkey_id"] in revoked_beneficiaries:
+            wallet_address = None
+        else:
+            wallet_address = _resolve_wallet(leg["beneficiary_pubkey_id"], store=store, log=lg, registry=reg)
         leg_status = "routable" if wallet_address is not None else "credited-unpaid"
         final_legs.append(
             {
@@ -427,3 +497,159 @@ def compile_route_manifest(
     )
 
     return {**result, "manifest": payload}
+
+
+# ---------------------------------------------------------------------------
+# Executor contract surface (D4) - pure reads, no writes
+# ---------------------------------------------------------------------------
+
+
+def get_manifest_for_event(event_ref, *, store=None, log=None, registry=None) -> dict | None:
+    """The head manifest for event_ref, envelope-verified and parsed.
+
+    Returns None if no manifest exists. Returns a dict with keys:
+      manifest_hash, manifest (parsed payload), pubkey_id, signature, supersedes.
+    Raises RouteTamperError if the head's own envelope fails the integrity bind,
+    RouteChainError if the chain is malformed. Never returns an unverified
+    manifest, and a malformed chain is NEVER reported as absence (None means
+    exactly one thing: no manifest exists for this event_ref) - silently
+    reading a corrupt store as "nothing to pay" is the failure mode this
+    unit exists to prevent.
+    """
+    from zephyr.attribution import get_recorder
+    from zephyr.claims import get_claims_store, verify_route_manifest_row
+    from zephyr.registry import get_registry
+
+    st = store if store is not None else get_claims_store()
+    lg = log if log is not None else get_recorder()
+    reg = registry if registry is not None else get_registry()
+
+    head = st.latest_route_manifest_for_event(event_ref)  # raises RouteChainError, never guesses
+    if head is None:
+        return None
+
+    vr = verify_route_manifest_row(head, log=lg, registry=reg)
+    if not vr.ok:
+        raise RouteTamperError(f"{vr.failure_mode}: {head['manifest_hash']}", failure_mode=vr.failure_mode)
+
+    return {
+        "manifest_hash": head["manifest_hash"],
+        "manifest": json.loads(head["payload_json"]),
+        "pubkey_id": (vr.envelope or {}).get("pubkey_id"),
+        "signature": (vr.envelope or {}).get("signature"),
+        "supersedes": head["supersedes"],
+    }
+
+
+def is_current_head(event_ref, manifest_hash, *, store=None) -> bool:
+    """True iff manifest_hash is the chain head for event_ref right now.
+
+    The executor calls this immediately before moving value. A manifest that
+    was the head when the run started may have been superseded by a
+    revocation since. Raises RouteChainError if the chain is malformed - a
+    wedged store is never silently reported as "not the head".
+    """
+    from zephyr.claims import get_claims_store
+
+    st = store if store is not None else get_claims_store()
+    head = st.latest_route_manifest_for_event(event_ref)
+    if head is None:
+        return False
+    return head["manifest_hash"] == manifest_hash
+
+
+def reverify_leg(manifest, leg, *, store=None, log=None, registry=None) -> dict:
+    """Re-run the full resolution check for one leg at execution time.
+
+    Returns {"payable": bool, "wallet_address": str | None, "reason": str}.
+    payable=True requires ALL of: leg_status=="routable" in the manifest, a
+    currently verified non-revoked self-signed wallet_binding for the
+    beneficiary, and the freshly resolved address EQUAL to the leg's recorded
+    wallet_address. Any mismatch returns payable=False with reason in
+    {"not_routable", "binding_revoked", "binding_unverified", "address_changed",
+    "unknown_key"} - it does not raise. A stale routable never pays.
+
+    Returning rather than raising is deliberate: partial completion must be
+    honest in the ledger, so the executor needs to skip one leg and continue,
+    not abort the run. Tamper (as opposed to an unpayable-but-legitimate leg)
+    still raises RouteTamperError from the underlying bind - e.g. a deleted
+    wallet_binding domain row surfaces as missing_domain_row, unchanged.
+    """
+    from zephyr.attribution import get_recorder
+    from zephyr.claims import get_claims_store, verify_wallet_binding_row
+    from zephyr.claims import resolve_wallet as _resolve_wallet
+    from zephyr.registry import get_registry
+
+    st = store if store is not None else get_claims_store()
+    lg = log if log is not None else get_recorder()
+    reg = registry if registry is not None else get_registry()
+
+    if leg.get("leg_status") != "routable":
+        return {"payable": False, "wallet_address": None, "reason": "not_routable"}
+
+    bpid = leg["beneficiary_pubkey_id"]
+
+    if reg.lookup(bpid) is None:
+        return {"payable": False, "wallet_address": None, "reason": "unknown_key"}
+
+    fresh_address = _resolve_wallet(bpid, store=st, log=lg, registry=reg)
+
+    if fresh_address is None:
+        rows = st.list_wallet_bindings_for_subject(bpid)
+        if rows:
+            latest = max(rows, key=lambda r: r["seq"])
+            if latest["revokes"]:
+                return {"payable": False, "wallet_address": None, "reason": "binding_revoked"}
+            vr = verify_wallet_binding_row(latest, log=lg, registry=reg)
+            if not vr.ok:
+                return {"payable": False, "wallet_address": None, "reason": "binding_unverified"}
+        return {"payable": False, "wallet_address": None, "reason": "binding_unverified"}
+
+    if fresh_address != leg.get("wallet_address"):
+        return {"payable": False, "wallet_address": fresh_address, "reason": "address_changed"}
+
+    return {"payable": True, "wallet_address": fresh_address, "reason": "ok"}
+
+
+def describe_manifest_chain(event_ref, *, store=None) -> dict:
+    """Human-readable chain diagnostic. NEVER raises on a malformed chain.
+
+    Returns {"event_ref", "rows": [...], "heads": [...], "roots": [...],
+             "well_formed": bool, "failure_mode": str | None}.
+
+    `rows` carries the RAW manifest_hash/supersedes/recorded_at/seq values
+    exactly as stored - unreconstructed, unsorted-by-inference. The
+    reconstructed interpretation lives in `heads`/`roots`; the raw edges live
+    in `rows`, so a human debugging a wedged store can see where the
+    application's reading of the chain and the literal table contents
+    disagree. This is the surface a human reads when RouteChainError fires -
+    the fork must be visible, not merely fatal. Wedged-state *recovery* is
+    deliberately out of scope: a repair tool for a forked chain IS a
+    chain-rewrite tool, the capability this unit exists to deny.
+    """
+    from zephyr.claims import get_claims_store
+
+    st = store if store is not None else get_claims_store()
+
+    raw_rows = st.raw_route_manifest_rows(event_ref)
+    superseded = {r["supersedes"] for r in raw_rows if r["supersedes"]}
+    heads = [r["manifest_hash"] for r in raw_rows if r["manifest_hash"] not in superseded]
+    roots = [r["manifest_hash"] for r in raw_rows if r["supersedes"] is None]
+
+    try:
+        st.route_manifest_chain_for_event(event_ref)
+    except RouteChainError as exc:
+        well_formed = False
+        failure_mode = exc.failure_mode
+    else:
+        well_formed = True
+        failure_mode = None
+
+    return {
+        "event_ref": event_ref,
+        "rows": raw_rows,
+        "heads": heads,
+        "roots": roots,
+        "well_formed": well_formed,
+        "failure_mode": failure_mode,
+    }
