@@ -32,7 +32,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--store-kind",
         default="mem",
-        help="Store kind label (mem, weaver, slot, …). Default: mem",
+        help="Store kind label (mem, weaver, slot, wallet_binding, routing_terms, "
+        "route_manifest, …). Default: mem",
     )
     parser.add_argument(
         "--payload",
