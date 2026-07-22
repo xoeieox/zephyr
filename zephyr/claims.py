@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -52,18 +53,24 @@ if TYPE_CHECKING:
     from zephyr.registry import PubkeyRegistry
     from zephyr.signing import AgentSigner
 
+_log = logging.getLogger(__name__)
+
 __all__ = [
     "ClaimsStore",
     "RouteChainError",
+    "RouteReceiptError",
     "ClaimIntegrityResult",
     "get_claims_store",
     "record_wallet_binding",
     "record_routing_terms",
+    "record_route_receipt",
     "resolve_wallet",
+    "route_receipts_for_manifest",
     "verify_claim",
     "verify_wallet_binding_row",
     "verify_routing_terms_row",
     "verify_route_manifest_row",
+    "verify_route_receipt_row",
 ]
 
 DEFAULT_CLAIMS_DB = Path(os.environ.get("ZEPHYR_CLAIMS_DB", "/data/zephyr/claims.db"))
@@ -111,6 +118,25 @@ CREATE TABLE IF NOT EXISTS route_manifests (
 CREATE INDEX IF NOT EXISTS route_manifests_event ON route_manifests(event_ref);
 CREATE UNIQUE INDEX IF NOT EXISTS route_manifests_chain_unique
     ON route_manifests(event_ref, COALESCE(supersedes, 'ROOT'));
+
+CREATE TABLE IF NOT EXISTS route_receipts (
+    seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    manifest_hash          TEXT NOT NULL,
+    beneficiary_pubkey_id  TEXT NOT NULL,
+    outcome                TEXT NOT NULL,
+    op_payment_id          TEXT,
+    sent_value             INTEGER,
+    sent_asset_code        TEXT,
+    sent_asset_scale       INTEGER,
+    leg_status             TEXT NOT NULL,
+    reason                 TEXT,
+    receipt_hash           TEXT NOT NULL UNIQUE,
+    recorded_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS route_receipts_manifest ON route_receipts(manifest_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS route_receipts_terminal_unique
+    ON route_receipts(manifest_hash, beneficiary_pubkey_id)
+    WHERE outcome IN ('settled', 'skipped');
 """
 
 # Rebuild specs for the D1b seq-column migration. SQLite forbids adding an
@@ -267,6 +293,24 @@ class RouteChainError(Exception):
         super().__init__(message)
         self.failure_mode = failure_mode
         self.event_ref = event_ref
+
+
+class RouteReceiptError(ValueError):
+    """A route_receipt write was refused against manifest/leg state (rail U2b, D1).
+
+    .failure_mode is one of: "unknown_manifest" (no head exists for the cited
+    event_ref), "not_head" (the cited manifest_hash is not the current chain
+    head), "no_such_leg" (beneficiary_pubkey_id is not a leg of the head
+    manifest), "not_routable" (a settled receipt against a credited-unpaid
+    leg), "amount_mismatch" (sent amount != the leg's manifest amount), or
+    "outcome_conflict" (a conflicting terminal receipt already exists for
+    this leg). A structural ValueError (missing settled amount fields, etc.)
+    is raised as a bare ValueError, not this class - see record_route_receipt.
+    """
+
+    def __init__(self, message: str, *, failure_mode: str):
+        super().__init__(message)
+        self.failure_mode = failure_mode
 
 
 # ---------------------------------------------------------------------------
@@ -485,10 +529,24 @@ class ClaimsStore:
         Raises RouteChainError on any malformed chain. Empty list if none.
         """
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM route_manifests WHERE event_ref = ?", (event_ref,)
-            ).fetchall()
-        rows = [dict(r) for r in rows]
+            rows = self._fetch_route_manifest_rows_locked(event_ref)
+        return self._chain_from_rows(event_ref, rows)
+
+    def _fetch_route_manifest_rows_locked(self, event_ref: str) -> list[dict]:
+        """Raw SELECT only - caller must already hold (or not need) self._lock."""
+        rows = self._conn.execute(
+            "SELECT * FROM route_manifests WHERE event_ref = ?", (event_ref,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _chain_from_rows(self, event_ref: str, rows: list[dict]) -> list[dict]:
+        """Pure chain-walk over already-fetched rows - no locking, no I/O.
+
+        Factored out of route_manifest_chain_for_event so a caller already
+        holding self._lock (e.g. the route_receipts atomic head re-check) can
+        reuse the exact same walk/raise semantics without re-entering the
+        (non-reentrant) lock.
+        """
         if not rows:
             return []
 
@@ -582,6 +640,222 @@ class ClaimsStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM route_manifests WHERE event_ref = ?", (event_ref,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- route_receipts (rail U2b, D1) --------------------------------------
+
+    def insert_route_receipt(
+        self,
+        *,
+        event_ref: str,
+        manifest_hash: str,
+        beneficiary_pubkey_id: str,
+        outcome: str,
+        op_payment_id: str | None,
+        sent_value: int | None,
+        sent_asset_code: str | None,
+        sent_asset_scale: int | None,
+        leg_status: str,
+        reason: str | None,
+        receipt_hash: str,
+        recorded_at: str,
+    ) -> dict:
+        """Atomically re-assert head-currency and reconcile the route_receipts row.
+
+        Domain-BEFORE-sign (Facets round-2): this is the atomic claims.db
+        critical section that MUST commit before record_route_receipt calls
+        record_signed - re-asserts *manifest_hash* is still the chain head for
+        *event_ref* on this same connection (a supersession landing after the
+        caller's cheap pre-check aborts with RouteReceiptError("not_head")),
+        then reconciles the (manifest_hash, beneficiary_pubkey_id) terminal
+        slot: a byte-identical repeat of an existing terminal row is a no-op
+        (newly_recorded=False), a conflicting terminal submission raises
+        RouteReceiptError("outcome_conflict"), and a `failed` submission
+        always inserts (failed rows are non-terminal and unconstrained).
+
+        Returns {"row": <dict>, "newly_recorded": bool}. Head-read +
+        reconcile + insert run inside one BEGIN IMMEDIATE transaction, so two
+        concurrent writers for the same leg cannot both pass the terminal
+        check and both insert - the partial unique index
+        (route_receipts_terminal_unique) is the backstop if they somehow did;
+        a resulting sqlite3.IntegrityError is caught and mapped back into the
+        same reconcile-by-read logic, never surfaced raw.
+        """
+        delay = _LOCK_RETRY_BASE_DELAY
+        for attempt in range(_LOCK_RETRY_ATTEMPTS):
+            is_last_attempt = attempt == _LOCK_RETRY_ATTEMPTS - 1
+            with self._lock:
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    return self._insert_route_receipt_txn(
+                        event_ref=event_ref,
+                        manifest_hash=manifest_hash,
+                        beneficiary_pubkey_id=beneficiary_pubkey_id,
+                        outcome=outcome,
+                        op_payment_id=op_payment_id,
+                        sent_value=sent_value,
+                        sent_asset_code=sent_asset_code,
+                        sent_asset_scale=sent_asset_scale,
+                        leg_status=leg_status,
+                        reason=reason,
+                        receipt_hash=receipt_hash,
+                        recorded_at=recorded_at,
+                    )
+                except (RouteReceiptError, RouteChainError, sqlite3.IntegrityError):
+                    raise
+                except sqlite3.OperationalError as exc:
+                    if not (_is_locked_error(exc) and not is_last_attempt):
+                        raise
+            time.sleep(delay)
+            delay *= 2
+        raise sqlite3.OperationalError(
+            f"insert_route_receipt: database locked after {_LOCK_RETRY_ATTEMPTS} attempts"
+        )
+
+    def _insert_route_receipt_txn(
+        self,
+        *,
+        event_ref: str,
+        manifest_hash: str,
+        beneficiary_pubkey_id: str,
+        outcome: str,
+        op_payment_id: str | None,
+        sent_value: int | None,
+        sent_asset_code: str | None,
+        sent_asset_scale: int | None,
+        leg_status: str,
+        reason: str | None,
+        receipt_hash: str,
+        recorded_at: str,
+    ) -> dict:
+        """One BEGIN IMMEDIATE attempt's body. Caller has already opened the
+        transaction. Commits on success. Rolls back and re-raises on any
+        error - a correct refusal (RouteReceiptError/RouteChainError), a
+        schema-level conflict re-raised after reconciliation failed to
+        explain it, or anything else (propagated unchanged)."""
+        try:
+            rows = self._fetch_route_manifest_rows_locked(event_ref)
+            chain = self._chain_from_rows(event_ref, rows)
+            current_head = chain[-1]["manifest_hash"] if chain else None
+            if current_head != manifest_hash:
+                raise RouteReceiptError(
+                    f"not_head: cited manifest_hash={manifest_hash!r} is no longer the "
+                    f"current head for event_ref={event_ref!r} (current head="
+                    f"{current_head!r})",
+                    failure_mode="not_head",
+                )
+
+            result = self._reconcile_route_receipt_insert(
+                manifest_hash=manifest_hash,
+                beneficiary_pubkey_id=beneficiary_pubkey_id,
+                outcome=outcome,
+                op_payment_id=op_payment_id,
+                sent_value=sent_value,
+                sent_asset_code=sent_asset_code,
+                sent_asset_scale=sent_asset_scale,
+                leg_status=leg_status,
+                reason=reason,
+                receipt_hash=receipt_hash,
+                recorded_at=recorded_at,
+            )
+            self._conn.commit()
+            return result
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _reconcile_route_receipt_insert(
+        self,
+        *,
+        manifest_hash: str,
+        beneficiary_pubkey_id: str,
+        outcome: str,
+        op_payment_id: str | None,
+        sent_value: int | None,
+        sent_asset_code: str | None,
+        sent_asset_scale: int | None,
+        leg_status: str,
+        reason: str | None,
+        receipt_hash: str,
+        recorded_at: str,
+    ) -> dict:
+        """Body of the reconcile+insert, assuming an open transaction. No
+        commit/rollback here - that is the caller's job."""
+        existing = self._conn.execute(
+            "SELECT * FROM route_receipts WHERE manifest_hash = ? AND beneficiary_pubkey_id = ? "
+            "AND outcome IN ('settled', 'skipped') ORDER BY seq DESC LIMIT 1",
+            (manifest_hash, beneficiary_pubkey_id),
+        ).fetchone()
+        if existing is not None and outcome in ("settled", "skipped"):
+            return self._match_or_conflict(
+                dict(existing), outcome, op_payment_id, sent_value, sent_asset_code,
+                sent_asset_scale, reason,
+            )
+
+        try:
+            self._conn.execute(
+                "INSERT INTO route_receipts "
+                "(manifest_hash, beneficiary_pubkey_id, outcome, op_payment_id, sent_value, "
+                " sent_asset_code, sent_asset_scale, leg_status, reason, receipt_hash, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    manifest_hash, beneficiary_pubkey_id, outcome, op_payment_id, sent_value,
+                    sent_asset_code, sent_asset_scale, leg_status, reason, receipt_hash, recorded_at,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            by_hash = self._conn.execute(
+                "SELECT * FROM route_receipts WHERE receipt_hash = ?", (receipt_hash,)
+            ).fetchone()
+            if by_hash is not None:
+                return {"row": dict(by_hash), "newly_recorded": False}
+            existing2 = self._conn.execute(
+                "SELECT * FROM route_receipts WHERE manifest_hash = ? AND beneficiary_pubkey_id = ? "
+                "AND outcome IN ('settled', 'skipped') ORDER BY seq DESC LIMIT 1",
+                (manifest_hash, beneficiary_pubkey_id),
+            ).fetchone()
+            if existing2 is None:
+                raise
+            return self._match_or_conflict(
+                dict(existing2), outcome, op_payment_id, sent_value, sent_asset_code,
+                sent_asset_scale, reason,
+            )
+
+        row = self._conn.execute(
+            "SELECT * FROM route_receipts WHERE receipt_hash = ?", (receipt_hash,)
+        ).fetchone()
+        return {"row": dict(row), "newly_recorded": True}
+
+    def _match_or_conflict(
+        self, existing: dict, outcome: str, op_payment_id, sent_value, sent_asset_code,
+        sent_asset_scale, reason,
+    ) -> dict:
+        same = (
+            existing["outcome"] == outcome
+            and existing["op_payment_id"] == op_payment_id
+            and existing["sent_value"] == sent_value
+            and existing["sent_asset_code"] == sent_asset_code
+            and existing["sent_asset_scale"] == sent_asset_scale
+            and existing["reason"] == reason
+        )
+        if same:
+            return {"row": existing, "newly_recorded": False}
+        raise RouteReceiptError(
+            f"outcome_conflict: manifest_hash={existing['manifest_hash']!r} "
+            f"beneficiary_pubkey_id={existing['beneficiary_pubkey_id']!r} already has a "
+            f"terminal receipt (outcome={existing['outcome']!r}) that conflicts with this "
+            f"submission (outcome={outcome!r})",
+            failure_mode="outcome_conflict",
+        )
+
+    def list_route_receipts_for_manifest(self, manifest_hash: str) -> list[dict]:
+        """Every route_receipts row for manifest_hash, exactly as stored - the
+        raw domain rows; per-leg selection + integrity re-verification is
+        route_receipts_for_manifest()'s job, not this store's."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM route_receipts WHERE manifest_hash = ?", (manifest_hash,)
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -710,6 +984,76 @@ def verify_routing_terms_row(row: dict, *, log=None, registry=None) -> ClaimInte
 
 def verify_route_manifest_row(row: dict, *, log=None, registry=None) -> ClaimIntegrityResult:
     return verify_claim(row, _route_manifest_payload(row), log=log, registry=registry)
+
+
+_ROUTE_RECEIPT_TOOL = "zephyr:route-receipt"
+
+
+def _route_receipt_summary(manifest_hash: str, beneficiary_pubkey_id: str, outcome: str) -> str:
+    """Deterministic from (manifest_hash, beneficiary_pubkey_id, outcome) alone -
+    route_receipts has no summary column, so this is recomputed identically
+    at write time and at read time rather than stored."""
+    return f"route receipt: {manifest_hash} -> {beneficiary_pubkey_id} ({outcome})"
+
+
+def _route_receipt_payload(row: dict) -> dict:
+    sent_amount = (
+        {
+            "value": row["sent_value"],
+            "asset_code": row["sent_asset_code"],
+            "asset_scale": row["sent_asset_scale"],
+        }
+        if row["outcome"] == "settled"
+        else None
+    )
+    return {
+        "route_receipt": {
+            "manifest_hash": row["manifest_hash"],
+            "beneficiary_pubkey_id": row["beneficiary_pubkey_id"],
+            "op_payment_id": row["op_payment_id"],
+            "sent_amount": sent_amount,
+            "leg_status": row["leg_status"],
+            "outcome": row["outcome"],
+            "reason": row["reason"],
+        }
+    }
+
+
+def verify_route_receipt_row(row: dict, *, log=None, registry=None) -> ClaimIntegrityResult:
+    """Recompute + re-verify a route_receipts domain row against its own deposit envelope.
+
+    Unlike verify_wallet_binding_row/verify_routing_terms_row/
+    verify_route_manifest_row, the envelope is looked up by the row's OWN
+    receipt_hash, not by domain_row["manifest_hash"] (which here names the
+    CITED route manifest, not the receipt's envelope) - so this cannot
+    delegate to verify_claim() directly. Never raises; a crash between the
+    domain-row commit and the record_signed deposit (D1's documented residual
+    failure) surfaces here as failure_mode="missing_envelope" - the orphan
+    domain row is permanently, fail-closed inert to any reader.
+    """
+    from zephyr.attribution import get_recorder
+
+    lg = log if log is not None else get_recorder()
+    payload = _route_receipt_payload(row)
+    summary = _route_receipt_summary(row["manifest_hash"], row["beneficiary_pubkey_id"], row["outcome"])
+    receipt_hash = row["receipt_hash"]
+
+    envelope = lg.get(receipt_hash, registry=registry)
+    if envelope is None:
+        return ClaimIntegrityResult(False, "missing_envelope", payload, None)
+
+    prov_dict = json.loads(envelope["provenance_json"])
+    for k in ("manifest_hash", "signature", "pubkey_id"):
+        prov_dict.pop(k, None)
+
+    recomputed = _compute_manifest_hash(payload, prov_dict, summary)
+    if recomputed != receipt_hash:
+        return ClaimIntegrityResult(False, "hash_mismatch", payload, envelope)
+
+    if envelope.get("verification_status") != "verified":
+        return ClaimIntegrityResult(False, envelope.get("verification_status"), payload, envelope)
+
+    return ClaimIntegrityResult(True, None, payload, envelope)
 
 
 # ---------------------------------------------------------------------------
@@ -948,3 +1292,308 @@ def resolve_wallet(
         return None
 
     return latest["wallet_address"]
+
+
+# ---------------------------------------------------------------------------
+# record_route_receipt / route_receipts_for_manifest (rail U2b, D1)
+# ---------------------------------------------------------------------------
+
+
+def record_route_receipt(
+    *,
+    event_ref: str,
+    manifest_hash: str,
+    beneficiary_pubkey_id: str,
+    outcome: str,
+    op_payment_id: str | None = None,
+    sent_value: int | None = None,
+    sent_asset_code: str | None = None,
+    sent_asset_scale: int | None = None,
+    reason: str | None = None,
+    agent_id: str,
+    signer: "AgentSigner | None" = None,
+    recorder: "AttributionLog | None" = None,
+    store: "ClaimsStore | None" = None,
+    log=None,
+    registry: "PubkeyRegistry | None" = None,
+    timestamp: str | None = None,
+) -> dict:
+    """Record a per-leg route_receipt: the executor's deposit-back for one
+    executed leg of a RouteManifest (rail U2b, D1).
+
+    Python owns signing; a Node executor calls this seam and never touches
+    keys, canonical JSON, or SQLite directly. *signer* defaults to the node
+    signing key (get_signer()'s process singleton) - there is no parameter
+    with which a caller can override it, so a production caller structurally
+    cannot sign a route_receipt as anything but the node key.
+
+    Dual-write mirroring record_wallet_binding's shape, but with the ORDER
+    INVERTED (Facets round-2 consensus): the atomic claims.db reconciliation
+    (ClaimsStore.insert_route_receipt - re-asserts head-currency, enforces
+    single-terminal-per-leg) runs and COMMITS FIRST; only after that commit
+    is record_signed called to sign and deposit to attribution.db. This makes
+    an orphan SIGNED deposit impossible - the only residual failure (a crash
+    between the two) leaves an inert orphan DOMAIN row with no envelope,
+    which verify_route_receipt_row reports as failure_mode="missing_envelope"
+    and route_receipts_for_manifest skips fail-closed. No money moves in this
+    unit either way.
+
+    Fail-closed order:
+      1. Structural validation of *outcome*'s required fields (ValueError).
+      2. Cheap fail-fast head lookup (get_manifest_for_event) - propagates
+         RouteChainError/RouteTamperError unchanged; None -> unknown_manifest;
+         hash mismatch -> not_head; leg absent -> no_such_leg.
+      3. settled-only business checks: leg_status must be "routable"
+         (not_routable) and sent_value/asset must equal the leg's manifest
+         amount exactly (amount_mismatch).
+      4. Atomic claims.db reconciliation (re-asserts head-currency on the
+         same connection, closing the TOCTOU window step 2 cannot) - may
+         raise RouteReceiptError("not_head") or ("outcome_conflict"), or
+         return an idempotent exact-repeat with newly_recorded=False.
+      5. Only on a newly-recorded domain row: sign + deposit via record_signed.
+    """
+    from archetypes_core.provenance import SCHEMA_VERSION_V01, Provenance
+
+    from zephyr.attribution import get_recorder, record_signed
+    from zephyr.registry import get_registry
+    from zephyr.routing import get_manifest_for_event
+    from zephyr.signing import get_signer
+
+    if outcome not in ("settled", "failed", "skipped"):
+        raise ValueError(
+            f"record_route_receipt: outcome={outcome!r} must be one of "
+            f"'settled', 'failed', 'skipped'"
+        )
+
+    if outcome == "settled":
+        if (
+            op_payment_id is None
+            or sent_value is None
+            or sent_asset_code is None
+            or sent_asset_scale is None
+        ):
+            raise ValueError(
+                "record_route_receipt: outcome='settled' requires op_payment_id and all "
+                "of sent_value/sent_asset_code/sent_asset_scale to be non-null"
+            )
+    elif outcome == "skipped":
+        if sent_value is not None or sent_asset_code is not None or sent_asset_scale is not None:
+            raise ValueError(
+                "record_route_receipt: outcome='skipped' must not carry sent_amount fields"
+            )
+        if reason is None:
+            raise ValueError("record_route_receipt: outcome='skipped' requires a reason")
+
+    ts = timestamp or _now_iso()
+
+    if log is None and recorder is not None:
+        log = recorder
+    if recorder is None and log is not None:
+        recorder = log
+    lg = log if log is not None else get_recorder()
+    rec = recorder if recorder is not None else get_recorder()
+    reg = registry if registry is not None else get_registry()
+    s = signer if signer is not None else get_signer()
+    st = store if store is not None else get_claims_store()
+
+    # ---- Fail-closed head + leg lookup -------------------------------------
+
+    head = get_manifest_for_event(event_ref, store=st, log=lg, registry=reg)
+    if head is None:
+        raise RouteReceiptError(
+            f"unknown_manifest: no manifest exists for event_ref={event_ref!r}",
+            failure_mode="unknown_manifest",
+        )
+    if head["manifest_hash"] != manifest_hash:
+        raise RouteReceiptError(
+            f"not_head: manifest_hash={manifest_hash!r} is not the current head for "
+            f"event_ref={event_ref!r} (current head={head['manifest_hash']!r})",
+            failure_mode="not_head",
+        )
+
+    route_manifest = head["manifest"]["route_manifest"]
+    leg = next(
+        (l for l in route_manifest["legs"] if l["beneficiary_pubkey_id"] == beneficiary_pubkey_id),
+        None,
+    )
+    if leg is None:
+        raise RouteReceiptError(
+            f"no_such_leg: beneficiary_pubkey_id={beneficiary_pubkey_id!r} is not a leg of "
+            f"manifest_hash={manifest_hash!r}",
+            failure_mode="no_such_leg",
+        )
+
+    if outcome == "settled":
+        if leg["leg_status"] != "routable":
+            raise RouteReceiptError(
+                f"not_routable: leg for beneficiary_pubkey_id={beneficiary_pubkey_id!r} has "
+                f"leg_status={leg['leg_status']!r}, not 'routable' - a credited-unpaid leg "
+                f"cannot be settled",
+                failure_mode="not_routable",
+            )
+        amount_in = route_manifest["amount_in"]
+        if (
+            sent_value != leg["amount"]
+            or sent_asset_code != amount_in["asset_code"]
+            or sent_asset_scale != amount_in["asset_scale"]
+        ):
+            raise RouteReceiptError(
+                f"amount_mismatch: sent_value={sent_value!r}/{sent_asset_code!r}/"
+                f"{sent_asset_scale!r} does not match leg amount={leg['amount']!r}/"
+                f"{amount_in['asset_code']!r}/{amount_in['asset_scale']!r}",
+                failure_mode="amount_mismatch",
+            )
+
+    # ---- Build payload + precompute receipt_hash ---------------------------
+
+    sent_amount = (
+        {"value": sent_value, "asset_code": sent_asset_code, "asset_scale": sent_asset_scale}
+        if outcome == "settled"
+        else None
+    )
+    payload = {
+        "route_receipt": {
+            "manifest_hash": manifest_hash,
+            "beneficiary_pubkey_id": beneficiary_pubkey_id,
+            "op_payment_id": op_payment_id,
+            "sent_amount": sent_amount,
+            "leg_status": leg["leg_status"],
+            "outcome": outcome,
+            "reason": reason,
+        }
+    }
+    summary = _route_receipt_summary(manifest_hash, beneficiary_pubkey_id, outcome)
+
+    # Byte-for-byte the same canonicalization record_signed's to_lapis_return
+    # will perform - constructed with the SAME frozen timestamp so both
+    # computations land on an identical hash (never a fresh now() each time).
+    provenance = Provenance(
+        schema_version=SCHEMA_VERSION_V01,
+        agent_id=agent_id,
+        tool=_ROUTE_RECEIPT_TOOL,
+        timestamp=ts,
+        manifest_hash="",
+    )
+    prov_dict = provenance.to_dict()
+    for k in ("manifest_hash", "signature", "pubkey_id"):
+        prov_dict.pop(k, None)
+    receipt_hash = _compute_manifest_hash(payload, prov_dict, summary)
+
+    # ---- Atomic claims.db reconciliation, domain-BEFORE-sign ---------------
+
+    txn_result = st.insert_route_receipt(
+        event_ref=event_ref,
+        manifest_hash=manifest_hash,
+        beneficiary_pubkey_id=beneficiary_pubkey_id,
+        outcome=outcome,
+        op_payment_id=op_payment_id,
+        sent_value=sent_value,
+        sent_asset_code=sent_asset_code,
+        sent_asset_scale=sent_asset_scale,
+        leg_status=leg["leg_status"],
+        reason=reason,
+        receipt_hash=receipt_hash,
+        recorded_at=ts,
+    )
+
+    if not txn_result["newly_recorded"]:
+        row = txn_result["row"]
+        envelope = lg.get(row["receipt_hash"], registry=reg)
+        return {
+            "receipt_hash": row["receipt_hash"],
+            "pubkey_id": (envelope or {}).get("pubkey_id"),
+            "signature": (envelope or {}).get("signature"),
+            "newly_recorded": False,
+            "receipt": payload,
+        }
+
+    # ---- Sign + deposit (only after the domain-row commit) -----------------
+
+    result = record_signed(
+        payload,
+        agent_id=agent_id,
+        tool=_ROUTE_RECEIPT_TOOL,
+        store_kind="route_receipt",
+        key=f"{manifest_hash}:{beneficiary_pubkey_id}",
+        signer=s,
+        registry=reg,
+        recorder=rec,
+        summary=summary,
+        timestamp=ts,
+    )
+    assert result["manifest_hash"] == receipt_hash, (
+        "record_route_receipt: precomputed receipt_hash does not match record_signed's "
+        "own recomputation - canonicalization drifted"
+    )
+
+    return {
+        "receipt_hash": result["manifest_hash"],
+        "pubkey_id": result["pubkey_id"],
+        "signature": result["signature"],
+        "newly_recorded": True,
+        "receipt": payload,
+    }
+
+
+def route_receipts_for_manifest(
+    manifest_hash: str, *, store: "ClaimsStore | None" = None, log=None, registry=None
+) -> list[dict]:
+    """The latest terminal (else latest failed) route_receipt per leg of manifest_hash.
+
+    Queries the route_receipts DOMAIN TABLE by manifest_hash (NOT
+    list_by_store_kind_and_key, which is an exact-match on one leg's key and
+    cannot enumerate a manifest's receipts). For each leg, selects the latest
+    terminal (settled/skipped) row if one exists, else the latest failed row,
+    by max(seq) - never by recorded_at. Each candidate is re-verified via
+    verify_route_receipt_row(); a row failing the integrity bind for ANY
+    reason (including missing_envelope, the orphan-domain-row case) is
+    skipped fail-closed and logged, never raised.
+    """
+    from zephyr.attribution import get_recorder
+
+    st = store if store is not None else get_claims_store()
+    lg = log if log is not None else get_recorder()
+
+    rows = st.list_route_receipts_for_manifest(manifest_hash)
+    by_leg: dict[str, list[dict]] = {}
+    for row in rows:
+        by_leg.setdefault(row["beneficiary_pubkey_id"], []).append(row)
+
+    results = []
+    for bpid, leg_rows in by_leg.items():
+        terminal = [r for r in leg_rows if r["outcome"] in ("settled", "skipped")]
+        candidates = terminal if terminal else [r for r in leg_rows if r["outcome"] == "failed"]
+        if not candidates:
+            continue
+        latest = max(candidates, key=lambda r: r["seq"])
+
+        vr = verify_route_receipt_row(latest, log=lg, registry=registry)
+        if not vr.ok:
+            _log.info(
+                "route_receipts_for_manifest: skipping receipt seq=%s beneficiary=%s "
+                "manifest_hash=%s - integrity bind failed (%s)",
+                latest["seq"], bpid, manifest_hash, vr.failure_mode,
+            )
+            continue
+
+        results.append(
+            {
+                "beneficiary_pubkey_id": latest["beneficiary_pubkey_id"],
+                "outcome": latest["outcome"],
+                "op_payment_id": latest["op_payment_id"],
+                "sent_amount": (
+                    {
+                        "value": latest["sent_value"],
+                        "asset_code": latest["sent_asset_code"],
+                        "asset_scale": latest["sent_asset_scale"],
+                    }
+                    if latest["sent_value"] is not None
+                    else None
+                ),
+                "leg_status": latest["leg_status"],
+                "reason": latest["reason"],
+                "receipt_hash": latest["receipt_hash"],
+                "seq": latest["seq"],
+            }
+        )
+    return results
