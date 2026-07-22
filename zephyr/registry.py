@@ -34,6 +34,19 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+__all__ = [
+    "PubkeyRegistry",
+    "get_registry",
+    "is_human_namespace",
+    "HUMAN_EXACT",
+    "HUMAN_PREFIXES",
+    "ZEPHYR_HUMAN_ROOT_ANCHOR",
+    "node_canonical_target",
+    "verify_human_anchor_chain",
+    "verify_node_anchor_chain",
+    "node_anchor_status",
+]
+
 DEFAULT_KEYS_DIR = Path(os.environ.get("ZEPHYR_KEYS_DIR", "/data/zephyr/keys"))
 
 # Pinned root anchor for human-key trust chain (must be set/overridden before trust is granted)
@@ -295,6 +308,26 @@ class PubkeyRegistry:
             )
         return entry
 
+    def set_registered_by(self, pkid: str, registered_by: dict[str, str]) -> dict:
+        """Attach an anchoring signature onto an existing registry entry.
+
+        This is the write side of the vouch act (used by ``keymint vouch-node``):
+        the entry itself is unchanged except for ``registered_by``. Raises
+        ValueError if *pkid* is not already registered — vouch-node never
+        creates, repairs, or infers an entry.
+        """
+        entry = self.lookup(pkid)
+        if entry is None:
+            raise ValueError(f"set_registered_by: pubkey_id={pkid!r} not in registry")
+
+        entry["registered_by"] = registered_by
+
+        path = self._path(pkid)
+        with self._lock:
+            path.write_text(json.dumps(entry, indent=2, sort_keys=True))
+            log.info("zephyr.registry: set registered_by on %s", pkid)
+        return entry
+
     def lookup(self, pkid: str) -> dict | None:
         """Return the registry entry for *pkid*, or None if not found.
 
@@ -377,35 +410,52 @@ def get_registry() -> PubkeyRegistry:
 # ---------------------------------------------------------------------------
 
 
-def verify_human_anchor_chain(
-    entry: dict, registry: "PubkeyRegistry | None" = None
+def node_canonical_target(
+    pkid: str, public_key_hex: str, agent_id: str, valid_from: str, node_binding: dict | None
+) -> str:
+    """Canonical signing target for a node's anchoring vouch.
+
+    Same shape as the human target plus ``node_binding``, so the vouch binds the
+    *machine* identity, not merely the key: json.dumps([pubkey_id, public_key_hex,
+    agent_id, valid_from, node_binding], separators=(",", ":")) (fixed order, no
+    whitespace). ``vouch-node`` signs exactly this string; ``verify_node_anchor_chain``
+    reconstructs and verifies exactly this string.
+
+    ``sort_keys=True`` is required here (not just cosmetic): the registry
+    round-trips entries through JSON with ``sort_keys=True``, which reorders
+    ``node_binding``'s keys on disk. Without sorting here too, a freshly-registered
+    entry (insertion-order keys) and the same entry reloaded from disk
+    (alphabetical keys) would sign/verify different byte strings for the same
+    logical binding.
+    """
+    return json.dumps(
+        [pkid, public_key_hex, agent_id, valid_from, node_binding],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _verify_anchor_chain_subject(
+    pkid: str | None,
+    registered_by: dict | None,
+    signing_target: str,
+    registry: "PubkeyRegistry | None",
 ) -> tuple[bool, str]:
-    """Verify that a role='human' registry entry chains to the pinned root anchor.
+    """Role-agnostic depth-1 anchor-chain walk, shared by the human and node
+    verifiers.
 
-    Returns (trusted, detail) where:
-      (True, "...")  -- the entry is anchor-trusted and may be used for deposits
-      (False, "...") -- the entry is NOT trusted (no/invalid registered_by or wrong anchor)
+    Callers pre-validate the entry's role/shape and build *signing_target* (the
+    canonical target differs per subject kind); this only walks the chain: is
+    *pkid* the pinned anchor itself, or does *registered_by* carry a valid
+    signature from the anchor over *signing_target*.
 
-    A human entry is trusted iff:
-      1. Its pubkey_id IS the pinned root anchor (the bootstrap case), OR
-      2. It carries a valid registered_by signature from the anchor key itself
-
-    Signature target is the canonical UTF-8 bytes of
-    json.dumps([pubkey_id, public_key_hex, agent_id, valid_from], separators=(',', ':'))
-    (fixed order, no whitespace).
-
-    If ZEPHYR_HUMAN_ROOT_ANCHOR is unset, all human entries are untrusted.
+    If ZEPHYR_HUMAN_ROOT_ANCHOR is unset, no subject is trusted.
     """
     from zephyr.signing import verify_manifest
 
-    if entry.get("role") != "human":
-        return False, "entry is not role='human'"
-
-    # Anchor is unset: no human entries are trusted
     if ZEPHYR_HUMAN_ROOT_ANCHOR is None:
         return False, "ZEPHYR_HUMAN_ROOT_ANCHOR is not configured"
 
-    pkid = entry.get("pubkey_id")
     if not pkid:
         return False, "entry has no pubkey_id"
 
@@ -414,7 +464,6 @@ def verify_human_anchor_chain(
         return True, "entry is the pinned root anchor"
 
     # Non-anchor: must have a valid registered_by signature from the anchor
-    registered_by = entry.get("registered_by")
     if not registered_by:
         return False, "non-anchor entry has no registered_by signature"
 
@@ -436,11 +485,6 @@ def verify_human_anchor_chain(
     if anchor_entry is None:
         return False, f"pinned anchor {ZEPHYR_HUMAN_ROOT_ANCHOR!r} not in registry"
 
-    # Verify signature over the canonical signing target
-    signing_target = json.dumps(
-        [pkid, entry["public_key_hex"], entry["agent_id"], entry.get("valid_from", "")],
-        separators=(",", ":"),
-    )
     anchor_pubkey_hex = anchor_entry.get("public_key_hex")
     if not anchor_pubkey_hex:
         return False, f"anchor {ZEPHYR_HUMAN_ROOT_ANCHOR!r} has no public_key_hex"
@@ -456,6 +500,103 @@ def verify_human_anchor_chain(
         return False, "registered_by signature does not verify"
 
     return True, "registered_by signature verified from anchor"
+
+
+def verify_human_anchor_chain(
+    entry: dict, registry: "PubkeyRegistry | None" = None
+) -> tuple[bool, str]:
+    """Verify that a role='human' registry entry chains to the pinned root anchor.
+
+    Returns (trusted, detail) where:
+      (True, "...")  -- the entry is anchor-trusted and may be used for deposits
+      (False, "...") -- the entry is NOT trusted (no/invalid registered_by or wrong anchor)
+
+    A human entry is trusted iff:
+      1. Its pubkey_id IS the pinned root anchor (the bootstrap case), OR
+      2. It carries a valid registered_by signature from the anchor key itself
+
+    Signature target is the canonical UTF-8 bytes of
+    json.dumps([pubkey_id, public_key_hex, agent_id, valid_from], separators=(',', ':'))
+    (fixed order, no whitespace).
+
+    If ZEPHYR_HUMAN_ROOT_ANCHOR is unset, all human entries are untrusted.
+    """
+    if entry.get("role") != "human":
+        return False, "entry is not role='human'"
+
+    pkid = entry.get("pubkey_id")
+    signing_target = json.dumps(
+        [pkid, entry.get("public_key_hex"), entry.get("agent_id"), entry.get("valid_from", "")],
+        separators=(",", ":"),
+    )
+    return _verify_anchor_chain_subject(pkid, entry.get("registered_by"), signing_target, registry)
+
+
+def verify_node_anchor_chain(
+    entry: dict, registry: "PubkeyRegistry | None" = None
+) -> tuple[bool, str]:
+    """Verify that a role='node' registry entry chains to the pinned human root anchor.
+
+    Pure binary signature + chain check (substrate captures, never scores — see
+    module docstring / decision/zephyr-human-node-vouch-layering-2026-07-22): a
+    node's ``registered_by`` signature must resolve to the anchor-trusted human
+    root and verify over the node canonical target (see ``node_canonical_target``),
+    which includes ``node_binding`` so the vouch binds this node's machine
+    identity, not merely its key.
+
+    Returns (trusted, detail) with the same semantics as verify_human_anchor_chain.
+    This is additive-only: it never gates a deposit — see attribution.py's
+    unconditional node-signing pass.
+    """
+    if entry.get("role") != "node":
+        return False, "entry is not role='node'"
+
+    pkid = entry.get("pubkey_id")
+    signing_target = node_canonical_target(
+        pkid,
+        entry.get("public_key_hex"),
+        entry.get("agent_id"),
+        entry.get("valid_from", ""),
+        entry.get("node_binding"),
+    )
+    return _verify_anchor_chain_subject(pkid, entry.get("registered_by"), signing_target, registry)
+
+
+def node_anchor_status(pkid: str, registry: "PubkeyRegistry | None" = None) -> dict:
+    """Read-only vouch-status query for a node key. Purely informational — a
+    consumer (the Expert, a future assurance surface) surfaces this; no deposit
+    is ever gated on it.
+
+    Returns {"state": "anchored"|"self_asserted"|"invalid"|"unverifiable",
+    "root_tier": "software"|"hardware"|None}. ``root_tier`` (carried from the
+    anchoring root's assurance_tier) is populated only when state=="anchored" —
+    a software-rooted chain is never silently treated as equal to a
+    hardware-rooted one.
+
+    Mirrors verify-node's exit codes: self_asserted = no registered_by at all
+    (the additive baseline, checked before the anchor-pin state so it never
+    depends on whether a root is pinned); unverifiable = registered_by is
+    present but no root anchor is pinned to check it against; invalid =
+    registered_by is present but does not chain to the pinned anchor.
+    """
+    reg = registry if registry is not None else get_registry()
+    entry = reg.lookup(pkid)
+    if entry is None or entry.get("role") != "node":
+        return {"state": "invalid", "root_tier": None}
+
+    if not entry.get("registered_by"):
+        return {"state": "self_asserted", "root_tier": None}
+
+    if ZEPHYR_HUMAN_ROOT_ANCHOR is None:
+        return {"state": "unverifiable", "root_tier": None}
+
+    trusted, _detail = verify_node_anchor_chain(entry, registry=reg)
+    if not trusted:
+        return {"state": "invalid", "root_tier": None}
+
+    anchor_entry = reg.lookup(ZEPHYR_HUMAN_ROOT_ANCHOR)
+    root_tier = anchor_entry.get("assurance_tier") if anchor_entry else None
+    return {"state": "anchored", "root_tier": root_tier}
 
 
 def _reset_registry() -> None:
