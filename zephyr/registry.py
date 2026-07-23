@@ -20,6 +20,9 @@ human namespace — the hard rule enforced here and in record().
 
 Human keys require anchor-chain verification: a depth-1 signature from the
 pinned root anchor (ZEPHYR_HUMAN_ROOT_ANCHOR), unless the key *is* the anchor itself.
+Node and agent keys chain to the same root the same way (also depth-1); agent
+anchoring is verdict-only here (``agent_acceptance``) — no consumer is wired to
+enforce it by this module.
 """
 
 from __future__ import annotations
@@ -45,6 +48,10 @@ __all__ = [
     "verify_human_anchor_chain",
     "verify_node_anchor_chain",
     "node_anchor_status",
+    "agent_canonical_target",
+    "verify_agent_anchor_chain",
+    "agent_anchor_status",
+    "agent_acceptance",
 ]
 
 DEFAULT_KEYS_DIR = Path(os.environ.get("ZEPHYR_KEYS_DIR", "/data/zephyr/keys"))
@@ -597,6 +604,116 @@ def node_anchor_status(pkid: str, registry: "PubkeyRegistry | None" = None) -> d
     anchor_entry = reg.lookup(ZEPHYR_HUMAN_ROOT_ANCHOR)
     root_tier = anchor_entry.get("assurance_tier") if anchor_entry else None
     return {"state": "anchored", "root_tier": root_tier}
+
+
+# ---------------------------------------------------------------------------
+# Agent-key anchor-chain verification
+# ---------------------------------------------------------------------------
+
+
+def agent_canonical_target(pkid: str, public_key_hex: str, agent_id: str, valid_from: str) -> str:
+    """Canonical signing target for an agent's anchoring vouch.
+
+    Agents carry no ``node_binding``, so this is the same flat shape
+    ``verify_human_anchor_chain`` builds inline: json.dumps([pubkey_id,
+    public_key_hex, agent_id, valid_from], separators=(",", ":")) (fixed order,
+    no whitespace, no sort_keys — a flat list of strings has no key-ordering
+    subtlety to guard against). ``vouch-agent`` signs exactly this string;
+    ``verify_agent_anchor_chain`` reconstructs and verifies exactly this string.
+
+    Deliberately a literal copy of the human inline construction rather than a
+    shared abstraction — the human inline path is left untouched so refactoring
+    this function can never silently shift the bytes a human vouch signs over.
+    """
+    return json.dumps([pkid, public_key_hex, agent_id, valid_from], separators=(",", ":"))
+
+
+def verify_agent_anchor_chain(
+    entry: dict, registry: "PubkeyRegistry | None" = None
+) -> tuple[bool, str]:
+    """Verify that a role='agent' registry entry chains to the pinned human root anchor.
+
+    Mirror of ``verify_node_anchor_chain`` for agent subjects: an agent's
+    ``registered_by`` signature must resolve to the anchor-trusted human root
+    and verify over the agent canonical target (see ``agent_canonical_target``).
+
+    Returns (trusted, detail) with the same semantics as verify_human_anchor_chain.
+    This is additive-only: it never gates a deposit — record_signed's TOFU
+    registration and capture path are untouched by this unit.
+    """
+    if entry.get("role") != "agent":
+        return False, "entry is not role='agent'"
+
+    pkid = entry.get("pubkey_id")
+    signing_target = agent_canonical_target(
+        pkid,
+        entry.get("public_key_hex"),
+        entry.get("agent_id"),
+        entry.get("valid_from", ""),
+    )
+    return _verify_anchor_chain_subject(pkid, entry.get("registered_by"), signing_target, registry)
+
+
+def agent_anchor_status(pkid: str, registry: "PubkeyRegistry | None" = None) -> dict:
+    """Read-only vouch-status query for an agent key. Purely informational — a
+    consumer (Bridge A's pm-review ratification, Bridge B's executor-agent
+    receipts, both later units) surfaces this; no deposit is ever gated on it
+    here.
+
+    Returns {"state": "anchored"|"self_asserted"|"invalid"|"unverifiable",
+    "root_tier": "software"|"hardware"|None}. ``root_tier`` is populated only
+    when state=="anchored".
+
+    A revoked (non-"active") entry reads as "invalid", not "self_asserted" —
+    a deliberate strengthening over ``node_anchor_status`` (which checks only
+    role): acceptance must never honor a revoked key, so a revoked agent must
+    never read as if it were merely unanchored.
+    """
+    reg = registry if registry is not None else get_registry()
+    entry = reg.lookup(pkid)
+    if entry is None or entry.get("role") != "agent":
+        return {"state": "invalid", "root_tier": None}
+
+    if entry.get("status") != "active":
+        return {"state": "invalid", "root_tier": None}
+
+    if not entry.get("registered_by"):
+        return {"state": "self_asserted", "root_tier": None}
+
+    if ZEPHYR_HUMAN_ROOT_ANCHOR is None:
+        return {"state": "unverifiable", "root_tier": None}
+
+    trusted, _detail = verify_agent_anchor_chain(entry, registry=reg)
+    if not trusted:
+        return {"state": "invalid", "root_tier": None}
+
+    anchor_entry = reg.lookup(ZEPHYR_HUMAN_ROOT_ANCHOR)
+    root_tier = anchor_entry.get("assurance_tier") if anchor_entry else None
+    return {"state": "anchored", "root_tier": root_tier}
+
+
+def agent_acceptance(pkid: str, registry: "PubkeyRegistry | None" = None) -> dict:
+    """The explicit acceptance verdict seam: the one place acceptance policy
+    lives so a later unit can tighten it without touching consumers.
+
+    Returns {"accept": bool, "state": str, "root_tier": str|None, "reason": str}.
+    ``accept`` is True iff state=="anchored". Every non-anchored state —
+    "self_asserted" in particular — is a hard-default quarantine: a consumer
+    MUST treat ``accept is False`` as a held fault requiring an explicit vouch
+    or rejection, never a silent deferral.
+
+    Never raises, never mutates the registry. This function returns a verdict
+    only; it does not enforce acceptance anywhere — no consumer is wired by
+    this unit.
+    """
+    status = agent_anchor_status(pkid, registry=registry)
+    state = status["state"]
+    return {
+        "accept": state == "anchored",
+        "state": state,
+        "root_tier": status["root_tier"],
+        "reason": state,
+    }
 
 
 def _reset_registry() -> None:

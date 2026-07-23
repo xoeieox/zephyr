@@ -1,10 +1,10 @@
 """python -m zephyr.keymint — the human-vouch keyring CLI (mint-human / mint-node /
-vouch-node / verify-node).
+vouch-node / verify-node / mint-agent / vouch-agent / verify-agent).
 
-Additive, capture-only tooling for the human-vouches-for-node trust chain: a node
-key keeps working self-asserted exactly as today (no change to record()'s
-deposit-acceptance logic); a vouch is a *verifiable stronger layer* added on top,
-never enforced at deposit time.
+Additive, capture-only tooling for the human-vouches-for-node/agent trust chains:
+a node or agent key keeps working self-asserted exactly as today (no change to
+record()'s or record_signed()'s deposit-acceptance logic); a vouch is a
+*verifiable stronger layer* added on top, never enforced at deposit time.
 
 Fail-closed on production paths: every subcommand refuses to operate against
 ``/data/zephyr/keys``, ``/data/zephyr/attribution.db``, or ``/data/zephyr/agent-keys``
@@ -136,6 +136,10 @@ def cmd_mint_node(args) -> int:
     return _mint(args, role="node", node_binding=node_binding)
 
 
+def cmd_mint_agent(args) -> int:
+    return _mint(args, role="agent", node_binding=None)
+
+
 def cmd_vouch_node(args) -> int:
     from zephyr.registry import PubkeyRegistry, node_canonical_target
     from zephyr.signing import (
@@ -214,6 +218,71 @@ def cmd_vouch_node(args) -> int:
     return 0
 
 
+def cmd_vouch_agent(args) -> int:
+    from zephyr.registry import PubkeyRegistry, agent_canonical_target
+    from zephyr.signing import (
+        load_or_create_agent_key,
+        pubkey_id as compute_pubkey_id,
+        sign_manifest,
+    )
+    from cryptography.hazmat.primitives import serialization
+
+    keys_dir = _keys_dir()
+    if _prod_guard_blocks(args.i_understand_this_is_prod, keys_dir=keys_dir):
+        return 2
+
+    reg = PubkeyRegistry(keys_dir)
+
+    agent_entry = reg.lookup(args.agent_pkid)
+    if agent_entry is None:
+        print(f"error: agent pubkey_id {args.agent_pkid!r} not found in registry", file=sys.stderr)
+        return 1
+    if agent_entry.get("role") != "agent":
+        print(
+            f"error: {args.agent_pkid!r} is not role='agent' (role={agent_entry.get('role')!r})",
+            file=sys.stderr,
+        )
+        return 1
+
+    human_key_path = Path(args.human_key)
+    if not human_key_path.exists():
+        print(f"error: --human-key path {human_key_path} does not exist", file=sys.stderr)
+        return 1
+
+    try:
+        human_key = load_or_create_agent_key(human_key_path)
+    except Exception as exc:
+        print(f"error: --human-key path {human_key_path} is not a valid key: {exc}", file=sys.stderr)
+        return 1
+
+    human_pub_bytes = human_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+    )
+    human_pkid = compute_pubkey_id(human_pub_bytes)
+    human_entry = reg.lookup(human_pkid)
+    if human_entry is None or human_entry.get("role") != "human":
+        print(
+            f"error: --human-key (pubkey_id={human_pkid!r}) does not resolve to a "
+            "registered role='human' key",
+            file=sys.stderr,
+        )
+        return 1
+
+    target = agent_canonical_target(
+        agent_entry["pubkey_id"],
+        agent_entry["public_key_hex"],
+        agent_entry["agent_id"],
+        agent_entry.get("valid_from", ""),
+    )
+    signature = sign_manifest(target, human_key)
+
+    reg.set_registered_by(
+        args.agent_pkid, {"signer_pkid": human_pkid, "signature": signature}
+    )
+    print(args.agent_pkid)
+    return 0
+
+
 _EXIT_BY_STATE = {
     "anchored": 0,
     "invalid": 1,
@@ -260,6 +329,45 @@ def cmd_verify_node(args) -> int:
     return _EXIT_BY_STATE[state]
 
 
+def cmd_verify_agent(args) -> int:
+    from zephyr.registry import PubkeyRegistry, agent_anchor_status
+
+    keys_dir = _keys_dir()
+    if _prod_guard_blocks(args.i_understand_this_is_prod, keys_dir=keys_dir):
+        return 2
+
+    reg = PubkeyRegistry(keys_dir)
+
+    entry = reg.lookup(args.agent_pkid)
+    if entry is None or entry.get("role") != "agent":
+        print(f"error: {args.agent_pkid!r} is not a registered role='agent' key", file=sys.stderr)
+        return 2
+
+    status = agent_anchor_status(args.agent_pkid, registry=reg)
+    state = status["state"]
+
+    if state == "self_asserted":
+        print("self_asserted: no registered_by present (additive baseline, no vouch)", file=sys.stderr)
+    elif state == "unverifiable":
+        print("unverifiable: ZEPHYR_HUMAN_ROOT_ANCHOR is not configured", file=sys.stderr)
+    elif state == "invalid":
+        print(
+            "invalid: registered_by is present but does not chain to the pinned anchor, "
+            "or the key is revoked",
+            file=sys.stderr,
+        )
+    else:
+        if status.get("root_tier") == "software":
+            print(
+                "WARNING: anchoring root is assurance_tier=software — transitional, "
+                "YubiKey hardening owed",
+                file=sys.stderr,
+            )
+        print("anchored", file=sys.stderr)
+
+    return _EXIT_BY_STATE[state]
+
+
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--i-understand-this-is-prod",
@@ -270,7 +378,8 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="keymint", description="Zephyr human-vouches-for-node keyring CLI."
+        prog="keymint",
+        description="Zephyr human-vouches-for-node/agent keyring CLI.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -301,6 +410,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("--node-pkid", required=True)
     _add_common_args(p_ver)
     p_ver.set_defaults(func=cmd_verify_node)
+
+    p_ma = sub.add_parser("mint-agent", help="Mint + register a role='agent' key.")
+    p_ma.add_argument("--agent-id", required=True)
+    p_ma.add_argument("--key-out", default=None, help="Private-key output path (default derived).")
+    p_ma.add_argument("--note", default="")
+    _add_common_args(p_ma)
+    p_ma.set_defaults(func=cmd_mint_agent)
+
+    p_va = sub.add_parser("vouch-agent", help="Human key vouches for a registered agent key.")
+    p_va.add_argument("--agent-pkid", required=True)
+    p_va.add_argument("--human-key", required=True, help="Path to the human private key.")
+    _add_common_args(p_va)
+    p_va.set_defaults(func=cmd_vouch_agent)
+
+    p_vera = sub.add_parser("verify-agent", help="Report an agent's anchor state via exit code.")
+    p_vera.add_argument("--agent-pkid", required=True)
+    _add_common_args(p_vera)
+    p_vera.set_defaults(func=cmd_verify_agent)
 
     return parser
 
