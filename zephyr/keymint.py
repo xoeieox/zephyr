@@ -288,6 +288,7 @@ _EXIT_BY_STATE = {
     "invalid": 1,
     "self_asserted": 3,
     "unverifiable": 4,
+    "revoked_anchor": 5,
 }
 
 
@@ -311,10 +312,20 @@ def cmd_verify_node(args) -> int:
     if state == "self_asserted":
         print("self_asserted: no registered_by present (additive baseline, no vouch)", file=sys.stderr)
     elif state == "unverifiable":
-        print("unverifiable: ZEPHYR_HUMAN_ROOT_ANCHOR is not configured", file=sys.stderr)
+        print(
+            "unverifiable: no root anchor is configured "
+            "(ZEPHYR_HUMAN_ROOT_ANCHOR / ZEPHYR_HUMAN_ROOT_ANCHORS)",
+            file=sys.stderr,
+        )
+    elif state == "revoked_anchor":
+        print(
+            "revoked_anchor: registered_by chains to a pinned anchor that has since "
+            "been revoked",
+            file=sys.stderr,
+        )
     elif state == "invalid":
         print(
-            "invalid: registered_by is present but does not chain to the pinned anchor",
+            "invalid: registered_by is present but does not chain to any pinned anchor",
             file=sys.stderr,
         )
     else:
@@ -349,10 +360,20 @@ def cmd_verify_agent(args) -> int:
     if state == "self_asserted":
         print("self_asserted: no registered_by present (additive baseline, no vouch)", file=sys.stderr)
     elif state == "unverifiable":
-        print("unverifiable: ZEPHYR_HUMAN_ROOT_ANCHOR is not configured", file=sys.stderr)
+        print(
+            "unverifiable: no root anchor is configured "
+            "(ZEPHYR_HUMAN_ROOT_ANCHOR / ZEPHYR_HUMAN_ROOT_ANCHORS)",
+            file=sys.stderr,
+        )
+    elif state == "revoked_anchor":
+        print(
+            "revoked_anchor: registered_by chains to a pinned anchor that has since "
+            "been revoked",
+            file=sys.stderr,
+        )
     elif state == "invalid":
         print(
-            "invalid: registered_by is present but does not chain to the pinned anchor, "
+            "invalid: registered_by is present but does not chain to any pinned anchor, "
             "or the key is revoked",
             file=sys.stderr,
         )
