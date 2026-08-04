@@ -18,11 +18,23 @@ Human-role entries are added out-of-band (never from an agent context).
 Agent/node keys auto-register on first deposit (TOFU) but may not claim the
 human namespace — the hard rule enforced here and in record().
 
-Human keys require anchor-chain verification: a depth-1 signature from the
-pinned root anchor (ZEPHYR_HUMAN_ROOT_ANCHOR), unless the key *is* the anchor itself.
-Node and agent keys chain to the same root the same way (also depth-1); agent
-anchoring is verdict-only here (``agent_acceptance``) — no consumer is wired to
-enforce it by this module.
+Human keys require anchor-chain verification: a depth-1 signature from a pinned
+root anchor, unless the key *is* one of the anchors itself. Node and agent keys
+chain to the same anchor set the same way (also depth-1); agent anchoring is
+verdict-only here (``agent_acceptance``) — no consumer is wired to enforce it
+by this module.
+
+Multi-anchor (Y0): the pinned root is a SET, not a single value —
+``ZEPHYR_HUMAN_ROOT_ANCHOR`` (singular, back-compat) and
+``ZEPHYR_HUMAN_ROOT_ANCHORS`` (plural, comma-separated) are unioned by
+``_resolve_anchor_pkids()``, read at call time so either or both may be set.
+Trust is any-of-N: any one *active* pinned anchor may vouch or self-verify —
+this is deliberately NOT M-of-N/threshold trust (``registered_by`` stays a
+single {signer_pkid, signature} dict; quorum signing is a registry schema
+change and out of scope). An anchor whose own registry entry is not
+``status == "active"`` confers no trust through either the bootstrap
+(self-is-anchor) or the registered_by-signer branch — revoking one anchor in
+the set never breaks a subject vouched by a still-active sibling anchor.
 """
 
 from __future__ import annotations
@@ -44,6 +56,7 @@ __all__ = [
     "HUMAN_EXACT",
     "HUMAN_PREFIXES",
     "ZEPHYR_HUMAN_ROOT_ANCHOR",
+    "ZEPHYR_HUMAN_ROOT_ANCHORS",
     "node_canonical_target",
     "verify_human_anchor_chain",
     "verify_node_anchor_chain",
@@ -56,9 +69,23 @@ __all__ = [
 
 DEFAULT_KEYS_DIR = Path(os.environ.get("ZEPHYR_KEYS_DIR", "/data/zephyr/keys"))
 
-# Pinned root anchor for human-key trust chain (must be set/overridden before trust is granted)
+# Pinned root anchor for human-key trust chain (must be set/overridden before trust is granted).
+# Kept for back-compat: str | None, __all__-exported, honoured when monkeypatched — both by
+# this repo's own tests and by lapis-pm's tests/test_signed_directive.py, which patches this
+# exact module attribute from a different repo. Do not retype or remove (see registry-multi-
+# anchor docstring below for why this must keep working unchanged).
 ZEPHYR_HUMAN_ROOT_ANCHOR: str | None = os.environ.get(
     "ZEPHYR_HUMAN_ROOT_ANCHOR", None
+)
+
+# Plural, comma-separated pinned-anchor set (Y0 multi-anchor). _resolve_anchor_pkids() takes
+# the UNION of this and ZEPHYR_HUMAN_ROOT_ANCHOR above, so either configuration — or both at
+# once during a migration — works. Any-of-N trust, not M-of-N: `registered_by` stays a single
+# {signer_pkid, signature} dict, and any one active anchor in the resolved set may vouch or
+# self-verify. Threshold/quorum signing is out of scope for this arc unit and would need a
+# registry schema change.
+ZEPHYR_HUMAN_ROOT_ANCHORS: str | None = os.environ.get(
+    "ZEPHYR_HUMAN_ROOT_ANCHORS", None
 )
 
 # ---------------------------------------------------------------------------
@@ -442,71 +469,132 @@ def node_canonical_target(
     )
 
 
+def _resolve_anchor_pkids() -> tuple[str, ...]:
+    """Return the ordered, de-duplicated tuple of pinned root-anchor pubkey_ids.
+
+    Union of ``ZEPHYR_HUMAN_ROOT_ANCHORS`` (plural, comma-separated — read first)
+    and ``ZEPHYR_HUMAN_ROOT_ANCHOR`` (singular, back-compat — appended if not
+    already present), so either configuration, or both set at once during a
+    migration, resolves to the same trust set.
+
+    Reads the module globals by name at CALL time, not at import — the bare
+    names below re-resolve against ``zephyr.registry.__dict__`` on every call,
+    so ``monkeypatch.setattr(zephyr.registry, "ZEPHYR_HUMAN_ROOT_ANCHOR", x)``
+    (this repo's tests, and lapis-pm's ``tests/test_signed_directive.py``) keeps
+    working exactly as before this unit landed. Capturing either value at
+    import time would silently break every one of those monkeypatches.
+    """
+    pkids: list[str] = []
+    if ZEPHYR_HUMAN_ROOT_ANCHORS:
+        for raw in ZEPHYR_HUMAN_ROOT_ANCHORS.split(","):
+            pkid = raw.strip()
+            if pkid and pkid not in pkids:
+                pkids.append(pkid)
+    if ZEPHYR_HUMAN_ROOT_ANCHOR and ZEPHYR_HUMAN_ROOT_ANCHOR not in pkids:
+        pkids.append(ZEPHYR_HUMAN_ROOT_ANCHOR)
+    return tuple(pkids)
+
+
 def _verify_anchor_chain_subject(
     pkid: str | None,
     registered_by: dict | None,
     signing_target: str,
     registry: "PubkeyRegistry | None",
-) -> tuple[bool, str]:
-    """Role-agnostic depth-1 anchor-chain walk, shared by the human and node
-    verifiers.
+) -> tuple[bool, str, str | None]:
+    """Role-agnostic depth-1 anchor-chain walk, shared by the human, node, and
+    agent verifiers.
 
     Callers pre-validate the entry's role/shape and build *signing_target* (the
     canonical target differs per subject kind); this only walks the chain: is
-    *pkid* the pinned anchor itself, or does *registered_by* carry a valid
-    signature from the anchor over *signing_target*.
+    *pkid* one of the pinned anchors itself, or does *registered_by* carry a
+    valid signature from one of the pinned anchors over *signing_target*.
 
-    If ZEPHYR_HUMAN_ROOT_ANCHOR is unset, no subject is trusted.
+    Returns ``(trusted, detail, matched_anchor_pkid)``. *matched_anchor_pkid* is
+    the specific anchor pubkey_id that decided the outcome — set on a trusted
+    result (so callers can attribute ``root_tier`` to the anchor that actually
+    verified the chain, never a differently-configured one — see G2), and also
+    set (with ``trusted=False``) when the deciding anchor was found but is not
+    ``status == "active"`` — the caller-visible signal that distinguishes
+    "vouched by a root we have since revoked" from "never vouched" or
+    "malformed vouch". It is ``None`` for every other failure mode.
+
+    Any-of-N: any one *active* pinned anchor may vouch or self-verify — this is
+    NOT M-of-N/threshold trust, and out of scope for this unit (would need a
+    registry schema change to `registered_by`).
+
+    An anchor whose own registry entry is not ``status == "active"`` confers no
+    trust, whether it is the bootstrap subject itself or the ``registered_by``
+    signer (G1) — a revoked root is never honoured by either branch.
+
+    If no anchor is configured (``_resolve_anchor_pkids()`` is empty), no
+    subject is trusted.
     """
     from zephyr.signing import verify_manifest
 
-    if ZEPHYR_HUMAN_ROOT_ANCHOR is None:
-        return False, "ZEPHYR_HUMAN_ROOT_ANCHOR is not configured"
+    anchor_pkids = _resolve_anchor_pkids()
+    if not anchor_pkids:
+        return False, "no root anchor is configured", None
 
     if not pkid:
-        return False, "entry has no pubkey_id"
+        return False, "entry has no pubkey_id", None
 
-    # Bootstrap: the entry IS the anchor
-    if pkid == ZEPHYR_HUMAN_ROOT_ANCHOR:
-        return True, "entry is the pinned root anchor"
+    reg = registry if registry is not None else get_registry()
 
-    # Non-anchor: must have a valid registered_by signature from the anchor
+    # Bootstrap: the entry IS one of the pinned anchors
+    if pkid in anchor_pkids:
+        self_entry = reg.lookup(pkid)
+        if self_entry is not None and self_entry.get("status") != "active":
+            return (
+                False,
+                f"anchor {pkid!r} is status={self_entry.get('status')!r} and confers no trust",
+                pkid,
+            )
+        return True, "entry is a pinned root anchor", pkid
+
+    # Non-anchor: must have a valid registered_by signature from a pinned anchor
     if not registered_by:
-        return False, "non-anchor entry has no registered_by signature"
+        return False, "non-anchor entry has no registered_by signature", None
 
     signer_pkid = registered_by.get("signer_pkid")
     signature = registered_by.get("signature")
     if not signer_pkid or not signature:
-        return False, "registered_by missing signer_pkid or signature"
+        return False, "registered_by missing signer_pkid or signature", None
 
-    if signer_pkid != ZEPHYR_HUMAN_ROOT_ANCHOR:
+    if signer_pkid not in anchor_pkids:
         return (
             False,
             f"registered_by signer_pkid {signer_pkid!r} is not the pinned anchor "
-            f"{ZEPHYR_HUMAN_ROOT_ANCHOR!r}",
+            f"(pinned set: {anchor_pkids!r})",
+            None,
         )
 
     # Load the anchor key from the registry
-    reg = registry if registry is not None else get_registry()
-    anchor_entry = reg.lookup(ZEPHYR_HUMAN_ROOT_ANCHOR)
+    anchor_entry = reg.lookup(signer_pkid)
     if anchor_entry is None:
-        return False, f"pinned anchor {ZEPHYR_HUMAN_ROOT_ANCHOR!r} not in registry"
+        return False, f"pinned anchor {signer_pkid!r} not in registry", None
+
+    if anchor_entry.get("status") != "active":
+        return (
+            False,
+            f"anchor {signer_pkid!r} is status={anchor_entry.get('status')!r} and confers no trust",
+            signer_pkid,
+        )
 
     anchor_pubkey_hex = anchor_entry.get("public_key_hex")
     if not anchor_pubkey_hex:
-        return False, f"anchor {ZEPHYR_HUMAN_ROOT_ANCHOR!r} has no public_key_hex"
+        return False, f"anchor {signer_pkid!r} has no public_key_hex", None
 
     try:
         anchor_pubkey_bytes = bytes.fromhex(anchor_pubkey_hex)
     except ValueError:
-        return False, f"anchor {ZEPHYR_HUMAN_ROOT_ANCHOR!r} public_key_hex is invalid hex"
+        return False, f"anchor {signer_pkid!r} public_key_hex is invalid hex", None
 
     # The signature must verify the signing_target (not a manifest_hash)
     # We use verify_manifest but pass signing_target as manifest_hash
     if not verify_manifest(signing_target, signature, anchor_pubkey_bytes):
-        return False, "registered_by signature does not verify"
+        return False, "registered_by signature does not verify", None
 
-    return True, "registered_by signature verified from anchor"
+    return True, "registered_by signature verified from anchor", signer_pkid
 
 
 def verify_human_anchor_chain(
@@ -526,10 +614,23 @@ def verify_human_anchor_chain(
     json.dumps([pubkey_id, public_key_hex, agent_id, valid_from], separators=(',', ':'))
     (fixed order, no whitespace).
 
-    If ZEPHYR_HUMAN_ROOT_ANCHOR is unset, all human entries are untrusted.
+    If no root anchor is configured (neither ``ZEPHYR_HUMAN_ROOT_ANCHOR`` nor
+    ``ZEPHYR_HUMAN_ROOT_ANCHORS``), all human entries are untrusted.
     """
+    trusted, detail, _anchor_pkid = _verify_human_anchor_chain_detailed(entry, registry)
+    return trusted, detail
+
+
+def _verify_human_anchor_chain_detailed(
+    entry: dict, registry: "PubkeyRegistry | None" = None
+) -> tuple[bool, str, str | None]:
+    """Like ``verify_human_anchor_chain`` but also returns the specific pinned
+    anchor pubkey_id that decided the outcome (see
+    ``_verify_anchor_chain_subject`` for the exact semantics of that third
+    value). Internal — used where the caller needs to attribute a result to
+    the deciding anchor (e.g. tier reporting, revoked-anchor state)."""
     if entry.get("role") != "human":
-        return False, "entry is not role='human'"
+        return False, "entry is not role='human'", None
 
     pkid = entry.get("pubkey_id")
     signing_target = json.dumps(
@@ -555,8 +656,17 @@ def verify_node_anchor_chain(
     This is additive-only: it never gates a deposit — see attribution.py's
     unconditional node-signing pass.
     """
+    trusted, detail, _anchor_pkid = _verify_node_anchor_chain_detailed(entry, registry)
+    return trusted, detail
+
+
+def _verify_node_anchor_chain_detailed(
+    entry: dict, registry: "PubkeyRegistry | None" = None
+) -> tuple[bool, str, str | None]:
+    """Like ``verify_node_anchor_chain`` but also returns the deciding anchor
+    pubkey_id — see ``_verify_human_anchor_chain_detailed``."""
     if entry.get("role") != "node":
-        return False, "entry is not role='node'"
+        return False, "entry is not role='node'", None
 
     pkid = entry.get("pubkey_id")
     signing_target = node_canonical_target(
@@ -574,17 +684,23 @@ def node_anchor_status(pkid: str, registry: "PubkeyRegistry | None" = None) -> d
     consumer (the Expert, a future assurance surface) surfaces this; no deposit
     is ever gated on it.
 
-    Returns {"state": "anchored"|"self_asserted"|"invalid"|"unverifiable",
-    "root_tier": "software"|"hardware"|None}. ``root_tier`` (carried from the
-    anchoring root's assurance_tier) is populated only when state=="anchored" —
-    a software-rooted chain is never silently treated as equal to a
-    hardware-rooted one.
+    Returns {"state": "anchored"|"self_asserted"|"invalid"|"unverifiable"|"revoked_anchor",
+    "root_tier": "software"|"hardware"|None}. ``root_tier`` is carried from the
+    *anchor that actually verified the chain* — not a fixed global lookup — so a
+    mixed-tier anchor set (e.g. a software root and a hardware root coexisting
+    during migration) is never misreported. Populated only when
+    state=="anchored" — a software-rooted chain is never silently treated as
+    equal to a hardware-rooted one.
 
     Mirrors verify-node's exit codes: self_asserted = no registered_by at all
     (the additive baseline, checked before the anchor-pin state so it never
     depends on whether a root is pinned); unverifiable = registered_by is
-    present but no root anchor is pinned to check it against; invalid =
-    registered_by is present but does not chain to the pinned anchor.
+    present but no root anchor is pinned to check it against; revoked_anchor =
+    registered_by chains to a pinned anchor whose registry entry is not
+    status=="active" (vouched by a root since revoked — distinct from
+    self_asserted, which never had a vouch at all); invalid = registered_by is
+    present but does not chain to any pinned anchor (wrong signer, bad
+    signature, or the deciding entry not found).
     """
     reg = registry if registry is not None else get_registry()
     entry = reg.lookup(pkid)
@@ -594,14 +710,16 @@ def node_anchor_status(pkid: str, registry: "PubkeyRegistry | None" = None) -> d
     if not entry.get("registered_by"):
         return {"state": "self_asserted", "root_tier": None}
 
-    if ZEPHYR_HUMAN_ROOT_ANCHOR is None:
+    if not _resolve_anchor_pkids():
         return {"state": "unverifiable", "root_tier": None}
 
-    trusted, _detail = verify_node_anchor_chain(entry, registry=reg)
+    trusted, _detail, anchor_pkid = _verify_node_anchor_chain_detailed(entry, registry=reg)
     if not trusted:
+        if anchor_pkid is not None:
+            return {"state": "revoked_anchor", "root_tier": None}
         return {"state": "invalid", "root_tier": None}
 
-    anchor_entry = reg.lookup(ZEPHYR_HUMAN_ROOT_ANCHOR)
+    anchor_entry = reg.lookup(anchor_pkid)
     root_tier = anchor_entry.get("assurance_tier") if anchor_entry else None
     return {"state": "anchored", "root_tier": root_tier}
 
@@ -641,8 +759,17 @@ def verify_agent_anchor_chain(
     This is additive-only: it never gates a deposit — record_signed's TOFU
     registration and capture path are untouched by this unit.
     """
+    trusted, detail, _anchor_pkid = _verify_agent_anchor_chain_detailed(entry, registry)
+    return trusted, detail
+
+
+def _verify_agent_anchor_chain_detailed(
+    entry: dict, registry: "PubkeyRegistry | None" = None
+) -> tuple[bool, str, str | None]:
+    """Like ``verify_agent_anchor_chain`` but also returns the deciding anchor
+    pubkey_id — see ``_verify_human_anchor_chain_detailed``."""
     if entry.get("role") != "agent":
-        return False, "entry is not role='agent'"
+        return False, "entry is not role='agent'", None
 
     pkid = entry.get("pubkey_id")
     signing_target = agent_canonical_target(
@@ -660,14 +787,23 @@ def agent_anchor_status(pkid: str, registry: "PubkeyRegistry | None" = None) -> 
     receipts, both later units) surfaces this; no deposit is ever gated on it
     here.
 
-    Returns {"state": "anchored"|"self_asserted"|"invalid"|"unverifiable",
-    "root_tier": "software"|"hardware"|None}. ``root_tier`` is populated only
-    when state=="anchored".
+    Returns {"state": "anchored"|"self_asserted"|"invalid"|"unverifiable"|"revoked_anchor",
+    "root_tier": "software"|"hardware"|None}. ``root_tier`` is carried from the
+    anchor that actually verified the chain (never a fixed global lookup — a
+    mixed-tier anchor set must never misreport which root vouched), and is
+    populated only when state=="anchored".
 
-    A revoked (non-"active") entry reads as "invalid", not "self_asserted" —
-    a deliberate strengthening over ``node_anchor_status`` (which checks only
-    role): acceptance must never honor a revoked key, so a revoked agent must
-    never read as if it were merely unanchored.
+    A revoked (non-"active") *subject* entry reads as "invalid", not
+    "self_asserted" — a deliberate strengthening over ``node_anchor_status``
+    (which checks only role): acceptance must never honor a revoked key, so a
+    revoked agent must never read as if it were merely unanchored. This check
+    is on the agent's own status and is unrelated to "revoked_anchor" below,
+    which is about the *anchor's* status, not the subject's.
+
+    "revoked_anchor" — distinct from "self_asserted" and from "invalid" — means
+    the agent's registered_by chains to a pinned anchor whose own registry
+    entry is not status=="active" (vouched by a root since revoked). See
+    ``node_anchor_status`` for the full state-mirroring rationale.
     """
     reg = registry if registry is not None else get_registry()
     entry = reg.lookup(pkid)
@@ -680,14 +816,16 @@ def agent_anchor_status(pkid: str, registry: "PubkeyRegistry | None" = None) -> 
     if not entry.get("registered_by"):
         return {"state": "self_asserted", "root_tier": None}
 
-    if ZEPHYR_HUMAN_ROOT_ANCHOR is None:
+    if not _resolve_anchor_pkids():
         return {"state": "unverifiable", "root_tier": None}
 
-    trusted, _detail = verify_agent_anchor_chain(entry, registry=reg)
+    trusted, _detail, anchor_pkid = _verify_agent_anchor_chain_detailed(entry, registry=reg)
     if not trusted:
+        if anchor_pkid is not None:
+            return {"state": "revoked_anchor", "root_tier": None}
         return {"state": "invalid", "root_tier": None}
 
-    anchor_entry = reg.lookup(ZEPHYR_HUMAN_ROOT_ANCHOR)
+    anchor_entry = reg.lookup(anchor_pkid)
     root_tier = anchor_entry.get("assurance_tier") if anchor_entry else None
     return {"state": "anchored", "root_tier": root_tier}
 
@@ -698,9 +836,10 @@ def agent_acceptance(pkid: str, registry: "PubkeyRegistry | None" = None) -> dic
 
     Returns {"accept": bool, "state": str, "root_tier": str|None, "reason": str}.
     ``accept`` is True iff state=="anchored". Every non-anchored state —
-    "self_asserted" in particular — is a hard-default quarantine: a consumer
-    MUST treat ``accept is False`` as a held fault requiring an explicit vouch
-    or rejection, never a silent deferral.
+    "self_asserted" in particular, and "revoked_anchor" (a subject whose only
+    vouching anchor has since been revoked — G1) — is a hard-default
+    quarantine: a consumer MUST treat ``accept is False`` as a held fault
+    requiring an explicit vouch or rejection, never a silent deferral.
 
     Never raises, never mutates the registry. This function returns a verdict
     only; it does not enforce acceptance anywhere — no consumer is wired by
