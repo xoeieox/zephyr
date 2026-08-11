@@ -1,11 +1,22 @@
 """Tests for settlement intent emitter (Unit 1 emitter seam).
 
+UPDATED for decision/zephyr-stops-minting-payment-claims-2026-08-11 (Leg 1):
+record() no longer calls _emit_settlement_intent on any path — Zephyr does
+not mint payment claims. AC1/AC3/AC4 below used to assert that a signed
+deposit auto-fired the emitter; that was exactly the defect. They now assert
+the corrected contract: record_signed() never fires the emitter, signed or
+not, new or duplicate. The emitter hook itself (ZEPHYR_DEPOSIT_EVENT_EMITTER
+/ get_emitter() / _emit_settlement_intent()) is retained for a future,
+explicitly declared dry run, so AC5 now exercises it directly instead of via
+record_signed().
+
 Acceptance criteria:
-  AC1  -- emitter fires on signed+new deposit
+  AC1  -- record_signed() (signed+new) does NOT fire the emitter
   AC2  -- emitter does NOT fire on unsigned deposits
-  AC3  -- emitter does NOT fire on duplicate deposits (idempotency)
-  AC4  -- fires exactly once via record_signed()
-  AC5  -- emitter exception caught and logged (never propagates)
+  AC3  -- emitter does NOT fire on duplicate deposits either
+  AC4  -- record_signed() results in ZERO emitter calls
+  AC5  -- emitter exception caught and logged (never propagates), exercised
+          via a direct _emit_settlement_intent() call (its only caller now)
   AC6  -- emitter singleton teardown in test cleanup
   AC7  -- intent queue append and status transitions
   AC8  -- intent queue idempotency (INSERT OR IGNORE)
@@ -19,6 +30,7 @@ import tempfile
 
 from zephyr.attribution import (
     AttributionLog,
+    _emit_settlement_intent,
     record_signed,
     set_emitter,
     get_emitter,
@@ -70,12 +82,13 @@ def reset_emitter_singleton():
 
 
 # ---------------------------------------------------------------------------
-# AC1 — emitter fires on signed+new deposit
+# AC1 — record_signed() (signed+new) does NOT fire the emitter
 # ---------------------------------------------------------------------------
 
 
-def test_ac1_emitter_fires_on_signed_new_deposit(tmp_path, tmp_log, tmp_signer, tmp_registry):
-    """Emitter receives provenance dict when a signed deposit is newly recorded."""
+def test_ac1_record_signed_does_not_fire_emitter(tmp_path, tmp_log, tmp_signer, tmp_registry):
+    """Zephyr does not mint payment claims: a signed, newly-recorded deposit
+    no longer triggers the settlement-intent emitter as a side effect."""
     emitted = []
 
     def capture_emitter(provenance: dict):
@@ -95,10 +108,7 @@ def test_ac1_emitter_fires_on_signed_new_deposit(tmp_path, tmp_log, tmp_signer, 
     )
 
     assert result["newly_recorded"] is True
-    assert len(emitted) == 1
-    assert emitted[0]["manifest_hash"] == result["manifest_hash"]
-    assert emitted[0]["pubkey_id"] == result["pubkey_id"]
-    assert emitted[0]["signature"] == result["signature"]
+    assert len(emitted) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -136,14 +146,14 @@ def test_ac2_emitter_does_not_fire_on_unsigned(tmp_path, tmp_log):
 
 
 # ---------------------------------------------------------------------------
-# AC3 — emitter does NOT fire on duplicate
+# AC3 — emitter does NOT fire on duplicate (or original) deposits
 # ---------------------------------------------------------------------------
 
 
 def test_ac3_emitter_does_not_fire_on_duplicate(
     tmp_path, tmp_log, tmp_signer, tmp_registry
 ):
-    """Emitter should not fire on duplicate deposits (same manifest_hash)."""
+    """Emitter never fires via record_signed() — first call or duplicate."""
     emitted = []
 
     def capture_emitter(provenance: dict):
@@ -164,24 +174,24 @@ def test_ac3_emitter_does_not_fire_on_duplicate(
     # First deposit (newly recorded)
     r1 = record_signed({"x": 1}, **kwargs)
     assert r1["newly_recorded"] is True
-    assert len(emitted) == 1
+    assert len(emitted) == 0
 
     # Second identical call (same manifest_hash due to same payload + timestamp)
     r2 = record_signed({"x": 1}, **kwargs)
     assert r2["newly_recorded"] is False
     assert r2["manifest_hash"] == r1["manifest_hash"]
-    assert len(emitted) == 1  # emitter should still only have fired once
+    assert len(emitted) == 0  # emitter never fires from record_signed()
 
 
 # ---------------------------------------------------------------------------
-# AC4 — fires exactly once via record_signed()
+# AC4 — record_signed() results in ZERO emitter calls
 # ---------------------------------------------------------------------------
 
 
-def test_ac4_fires_exactly_once_via_record_signed(
+def test_ac4_record_signed_never_fires_emitter(
     tmp_path, tmp_log, tmp_signer, tmp_registry
 ):
-    """record_signed() should result in exactly one emitter call."""
+    """record_signed() no longer results in any emitter call."""
     call_count = [0]
 
     def counting_emitter(provenance: dict):
@@ -198,8 +208,8 @@ def test_ac4_fires_exactly_once_via_record_signed(
         recorder=tmp_log,
     )
 
-    # CRITICAL: double-emit guard ensures exactly one call
-    assert call_count[0] == 1
+    # Zephyr does not mint payment claims: zero emits, not one.
+    assert call_count[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +217,13 @@ def test_ac4_fires_exactly_once_via_record_signed(
 # ---------------------------------------------------------------------------
 
 
-def test_ac5_emitter_exception_caught_and_not_propagated(
-    tmp_path, tmp_log, tmp_signer, tmp_registry
-):
-    """If emitter raises, the exception is caught and logged, not propagated."""
+def test_ac5_emitter_exception_caught_and_not_propagated(tmp_path):
+    """If emitter raises, the exception is caught and logged, not propagated.
+
+    _emit_settlement_intent() is no longer called from record() — it is
+    retained for a future declared dry run — so this exercises it directly,
+    its only remaining caller.
+    """
 
     def failing_emitter(provenance: dict):
         raise RuntimeError("Intentional test failure")
@@ -218,19 +231,7 @@ def test_ac5_emitter_exception_caught_and_not_propagated(
     set_emitter(failing_emitter)
 
     # Should not raise even though emitter raises
-    result = record_signed(
-        {"test": "payload"},
-        agent_id="agent:fail-test",
-        tool="test",
-        signer=tmp_signer,
-        registry=tmp_registry,
-        recorder=tmp_log,
-    )
-
-    assert result["newly_recorded"] is True
-    # Verify the deposit was still recorded
-    row = tmp_log.get(result["manifest_hash"], registry=tmp_registry)
-    assert row is not None
+    _emit_settlement_intent({"manifest_hash": "sha256:ac5-direct", "agent_id": "agent:fail-test"})
 
 
 # ---------------------------------------------------------------------------
