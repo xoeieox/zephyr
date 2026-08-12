@@ -363,9 +363,15 @@ def run_demo(
             "User A": "no wallet ✗ — credited, unpaid",
         }, t=1650)
 
-    # Settlement intents are automatically enqueued when deposits are recorded
+    # Zephyr does not mint payment claims (decision/zephyr-stops-minting-
+    # payment-claims-2026-08-11) — record() no longer auto-enqueues a
+    # settlement intent for every signed deposit. Act 3's purchase is
+    # exactly the explicit, declared dry run R3 of that decision asks for:
+    # a real purchase event just occurred, so the demo declares the intent
+    # itself, here, rather than it falling out of a deposit as a side effect.
     log.info("\n--- Settlement Phase ---")
-    log.info("Settlement intents for signed deposits are auto-enqueued by attribution.record()")
+    log.info("Act 3 purchase explicitly declares a settlement intent for the remix")
+    intent_queue.append(manifest_remix, prov_b)
 
     # Run settler
     settler = Settler(

@@ -326,10 +326,12 @@ class AttributionLog:
             self._conn.commit()
             newly_recorded = cur.rowcount > 0
 
-        # Emit settlement intent if newly recorded and signed
-        if newly_recorded and signature and pkid:
-            _emit_settlement_intent(provenance)
-
+        # Zephyr does not mint payment claims (decision/zephyr-stops-minting-
+        # payment-claims-2026-08-11). A signed deposit is recorded and verified
+        # on read; it no longer appends a one-cent settlement intent as a
+        # side effect. ZEPHYR_DEPOSIT_EVENT_EMITTER (get_emitter()) remains a
+        # general deposit-event hook for a future, explicitly declared dry
+        # run — it is just no longer fired from here by default.
         return newly_recorded
 
     # -- read / introspection (human-readable surface feeds; not agent-as-dest) --
@@ -796,13 +798,17 @@ def get_emitter() -> callable | None:
 
 
 def _emit_settlement_intent(provenance: dict) -> None:
-    """Emit a settlement intent after a signed deposit is recorded.
+    """Append-to-queue fallback for a configured deposit-event emitter.
 
-    Fires outside the attribution DB lock. Any exception is caught and logged
-    (never propagates to record() caller). If no emitter is configured, appends
-    to the default intent queue.
+    NOT called from record() (decision/zephyr-stops-minting-payment-claims-
+    2026-08-11 — Zephyr does not mint payment claims; see intent_queue.py's
+    module docstring). Retained so a future, explicitly declared dry run
+    (R3 of that decision) has a writer to call, and so ZEPHYR_DEPOSIT_EVENT_EMITTER
+    keeps a concrete default behavior when it has no configured emitter.
 
-    Intended to be called once per newly-recorded signed deposit, from record().
+    Fires outside the attribution DB lock. Any exception is caught and logged,
+    never propagates to the caller. If no emitter is configured, appends to
+    the default intent queue.
     """
     emitter = get_emitter()
     if emitter is None:
