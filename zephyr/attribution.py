@@ -22,6 +22,41 @@ Signing enforcement is controlled by ZEPHYR_SIGNING_MODE:
 The Tier-0 human-namespace guard fires regardless of ZEPHYR_SIGNING_MODE:
 any deposit claiming a human agent_id (``Erah`` or ``human:*``) MUST carry
 a valid signature from a registered role="human" key.
+
+Schema v0.2 addition (rail zephyr-witnessed-checkpoint-log-v0, D1):
+  deposits.seq  INTEGER PRIMARY KEY AUTOINCREMENT  -- store-assigned leaf
+    ordering. manifest_hash is a content hash and carries no order, and
+    recorded_at is caller-supplied and audit-only, never load-bearing for
+    selection (same rule as zephyr/claims.py) — so before this column
+    existed there was no stable, reproducible leaf index, which a Merkle
+    transparency log requires. No caller can set ``seq``; SQLite assigns it
+    on insert.
+
+    SQLite forbids adding an AUTOINCREMENT column via ALTER TABLE, so an
+    already-populated ``deposits`` table is upgraded via one transactional
+    rebuild (``zephyr._sqlite_migrate.rebuild_tables_for_seq_migration``,
+    guarded by ``PRAGMA table_info`` so re-opening an already-migrated store
+    is a no-op): ``manifest_hash`` demotes from PRIMARY KEY to UNIQUE so
+    ``seq`` can take the primary-key slot. The UNIQUE constraint is
+    load-bearing — INSERT-OR-IGNORE dedup in ``record()`` depends on it.
+
+    Historical-ordering honesty: the pre-migration copy is ordered
+    ``ORDER BY recorded_at, manifest_hash`` — a RECONSTRUCTION, not a
+    record. ``recorded_at`` was never trustworthy (it is caller-supplied),
+    so the resulting ``seq`` for rows that existed before this migration
+    ran is a best-effort ordering, not an attested one. The Merkle tree
+    built over ``seq`` (``zephyr.transparency``, D2/D3) attests the log
+    *from the migration checkpoint forward*; it cannot attest that
+    pre-migration history was itself un-reordered. Say this in checkpoint
+    output too — never let a verdict imply the stronger property.
+
+    This is a NEW rebuild spec (``_DEPOSITS_REBUILD_SPEC`` below), not a
+    reuse of ``zephyr/claims.py``'s ``_migrate_add_seq`` — that function's
+    ``_TABLE_REBUILD_SPECS`` does not register ``deposits``, and it operates
+    against a different database file entirely (``claims.db``, not
+    ``attribution.db``). See ``zephyr/_sqlite_migrate.py``'s module
+    docstring for the full reasoning, including the import-cycle
+    constraint that rules out reusing claims.py's helper directly.
 """
 
 from __future__ import annotations
@@ -72,6 +107,63 @@ _MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS deposits_pubkey ON deposits(pubkey_id);
 """
 
+# Rebuild spec for the D1 seq-column migration (rail
+# zephyr-witnessed-checkpoint-log-v0). See zephyr/_sqlite_migrate.py's module
+# docstring for why this is a NEW spec/module rather than a reuse of
+# zephyr/claims.py's _TABLE_REBUILD_SPECS / _migrate_add_seq. This spec runs
+# AFTER _migrate() (the ALTER-based additive migration above), so the
+# signature/pubkey_id/derived_from columns already exist on any table this
+# rebuild copies from — the column list below carries all of them across.
+_DEPOSITS_REBUILD_SPEC = {
+    "deposits": {
+        "columns": [
+            "manifest_hash", "agent_id", "tool", "model", "timestamp",
+            "store_kind", "target_key", "schema_version", "provenance_json",
+            "recorded_at", "signature", "pubkey_id", "derived_from",
+        ],
+        "create": """
+            CREATE TABLE {name} (
+                seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+                manifest_hash   TEXT NOT NULL UNIQUE,
+                agent_id        TEXT,
+                tool            TEXT,
+                model           TEXT,
+                timestamp       TEXT,
+                store_kind      TEXT,
+                target_key      TEXT,
+                schema_version  TEXT,
+                provenance_json TEXT NOT NULL,
+                recorded_at     TEXT NOT NULL,
+                signature       TEXT,
+                pubkey_id       TEXT,
+                derived_from    TEXT
+            )
+        """,
+        "indexes": [
+            "CREATE INDEX IF NOT EXISTS deposits_agent    ON deposits(agent_id)",
+            "CREATE INDEX IF NOT EXISTS deposits_tool     ON deposits(tool)",
+            "CREATE INDEX IF NOT EXISTS deposits_recorded ON deposits(recorded_at)",
+            "CREATE INDEX IF NOT EXISTS deposits_store    ON deposits(store_kind)",
+            "CREATE INDEX IF NOT EXISTS deposits_pubkey   ON deposits(pubkey_id)",
+        ],
+        # Reconstruction, not a record — recorded_at was never trustworthy
+        # (audit-only, caller-supplied). Preserved unchanged from the
+        # claims.py precedent (ORDER BY recorded_at, manifest_hash).
+        "order_by": "recorded_at, manifest_hash",
+    },
+}
+
+
+def _migrate_add_seq(conn: sqlite3.Connection) -> None:
+    """Idempotent transactional rebuild adding deposits.seq — the D1
+    store-assigned leaf ordering the RFC 6962 transparency log
+    (zephyr/transparency.py) is built over. See _DEPOSITS_REBUILD_SPEC and
+    zephyr/_sqlite_migrate.py for the mechanism; no caller can set seq.
+    """
+    from zephyr._sqlite_migrate import rebuild_tables_for_seq_migration
+
+    rebuild_tables_for_seq_migration(conn, _DEPOSITS_REBUILD_SPEC)
+
 
 # ---------------------------------------------------------------------------
 # Verification result
@@ -109,6 +201,7 @@ class AttributionLog:
         self._conn.executescript(_SCHEMA)
         self._migrate()
         self._conn.commit()
+        _migrate_add_seq(self._conn)
 
     def _migrate(self) -> None:
         """Additive schema migration: add nullable columns if absent."""
@@ -398,6 +491,22 @@ class AttributionLog:
     def count(self) -> int:
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) AS n FROM deposits").fetchone()["n"]
+
+    def leaves_by_seq(self) -> list[tuple[int, str]]:
+        """All (seq, manifest_hash) pairs ordered by seq ascending — the
+        leaf ordering the RFC 6962 transparency log (zephyr.transparency,
+        rail zephyr-witnessed-checkpoint-log-v0) is built over.
+
+        Read-only: issuing a checkpoint reads deposits, it never mutates
+        them (invariant). seq is store-assigned (AUTOINCREMENT); no caller
+        can set it, so this ordering is tamper-evident from the D1
+        migration checkpoint forward.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, manifest_hash FROM deposits ORDER BY seq ASC"
+            ).fetchall()
+        return [(r["seq"], r["manifest_hash"]) for r in rows]
 
     def list_by_store_kind_and_key(self, store_kind: str, key: str) -> list[dict]:
         """All deposits for (store_kind, key), oldest first. Read-only; no verification.
