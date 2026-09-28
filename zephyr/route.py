@@ -23,7 +23,7 @@ Subcommands:
                      machine (rail U2b, D2).
   record-receipt  - write a signed route_receipt via zephyr.claims (D1).
 
-Exit-code contract (also documented in CLAUDE.md):
+Exit-code contract (also documented in AGENTS.md):
   0  ok
   10 RouteChainError   - wedged store; caller STOPS, does not pay
   11 RouteTamperError

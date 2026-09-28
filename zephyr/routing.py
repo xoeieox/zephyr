@@ -25,7 +25,7 @@ reverify_leg() are the three pure-read helpers U2b builds on - they exist so
 the executor never reimplements head selection, envelope parsing, or per-leg
 re-verification. describe_manifest_chain() is a non-raising human diagnostic
 for a wedged store; wedged-state *recovery* is deliberately out of scope (a
-chain-repair tool is a chain-rewrite tool - see CLAUDE.md).
+chain-repair tool is a chain-rewrite tool - see AGENTS.md).
 """
 
 from __future__ import annotations

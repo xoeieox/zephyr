@@ -84,7 +84,7 @@ this unit ever constructs or emits one:
 The checkpoint is always signed with the NODE identity
 (``zephyr.signing.get_signer()``'s default, no caller override) — mirroring
 the ``record-receipt`` precedent in zephyr/route.py. Human private keys
-never live on BRIX/StarHouse (CLAUDE.md); this module never accepts a
+never live on BRIX/StarHouse (AGENTS.md); this module never accepts a
 ``--signer``/``--key`` override for checkpoint issuance.
 
 ``tree_size`` is monotonic per ``log``: issuing a checkpoint whose
