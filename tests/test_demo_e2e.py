@@ -458,6 +458,39 @@ def test_demo_consent_denied_remix_skips():
         skip = next(e for e in scenes["act-2-remix"]["events"] if e["kind"] == "consent_skip")
         assert skip["detail"]["report"] == "denied"
 
+        # Hygiene MINOR (capture-doc names skipped artifact): the skipped remix
+        # was never deposited, so the doc's artifact registry must not name it.
+        artifact_ids = {a["id"] for a in doc["artifacts"]}
+        assert "hat-remix" not in artifact_ids, artifact_ids
+        assert artifact_ids == {"smiley"}, artifact_ids
+        # ...and the act-3 purchase beat must not name it either.
+        purchase = next(e for e in scenes["act-3-purchase"]["events"] if e["kind"] == "purchase")
+        assert "artifact" not in purchase["detail"], purchase["detail"]
+        assert "hat-remix" not in str(purchase)
+        chain = next(e for e in scenes["act-3-purchase"]["events"] if e["kind"] == "chain")
+        assert "hat-remix" not in str(chain)
+
+
+def test_demo_consent_skipped_remix_is_absent_from_capture_artifacts():
+    """Hygiene MINOR (demo capture-doc names skipped artifact): hat-remix used
+    to be registered unconditionally before the consent gate, so a skipped
+    remix still showed up in doc["artifacts"] - the capture-doc named a thing
+    that was never deposited. Registration is now gated on the remix actually
+    proceeding, and the act-3 purchase emit guards its hat-remix reference."""
+    with tempfile.TemporaryDirectory(prefix="zephyr-consent-artifacts-") as td:
+        results, doc, attr_db, registry_dir = _run_consent_demo(td, {"declare": False})
+
+        assert results["consent"]["remix_skipped"] is True
+        ids = {a["id"] for a in doc["artifacts"]}
+        assert "hat-remix" not in ids, f"skipped artifact named in capture-doc: {ids}"
+        assert "smiley" in ids, ids
+        # the surviving artifact is the original, and it stands alone
+        assert len(doc["artifacts"]) == 1
+        assert doc["artifacts"][0]["id"] == "smiley"
+        assert "derived_from" not in doc["artifacts"][0]
+        # no ledger row was minted for an artifact that does not exist
+        assert not any(row["artifact"] == "hat-remix" for row in doc["ledger"])
+
 
 def test_demo_consent_undeclared_remix_skips_conservatively():
     """undeclared (nothing declared) -> the v0 consumer skips: undeclared is

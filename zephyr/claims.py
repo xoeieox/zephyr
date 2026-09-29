@@ -1544,7 +1544,12 @@ def verify_use_terms_row(row: dict, *, log=None, registry=None) -> ClaimIntegrit
     """
     try:
         payload = _use_terms_payload(row)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+        # KeyError too: the try body performs seven bare row[...] subscripts
+        # via _use_terms_payload, and a key-missing row dict must land on the
+        # same named failure as malformed JSON rather than escape the "never
+        # raises" guarantee above (fail-open-by-crash into the caller's
+        # except-block is the failure mode this guards).
         return ClaimIntegrityResult(False, "malformed_uses_json", None, None)
     return verify_claim(row, payload, log=log, registry=registry)
 
@@ -1743,10 +1748,14 @@ def resolve_use_terms(
         )
         return None
 
-    if latest["revokes"]:
+    # Read the revocation verdict off the VERIFIED payload, not the raw column,
+    # honoring this function's own pinned law: every verdict field comes from
+    # the verified ClaimIntegrityResult.payload.
+    body = result.payload["use_terms"]
+
+    if body["revokes"]:
         return None
 
-    body = result.payload["use_terms"]
     return {
         "subject": body["subject"],
         "declared_by": body["declared_by"],

@@ -732,6 +732,27 @@ def test_ac7_malformed_denied_json_never_raises_and_warns(tmp_path, tmp_log, tmp
     ]
 
 
+def test_ac7_key_missing_row_never_raises_and_is_named(tmp_path, tmp_log, tmp_registry, tmp_claims_store):
+    """Hygiene MINOR (KeyError in verify except): the try body performs seven
+    bare row[...] subscripts, so a key-missing row dict must land on the same
+    named malformed_uses_json failure as malformed JSON - never escape the
+    never-raises guarantee as a crash."""
+    s, result = _declare(tmp_path, tmp_log, tmp_registry, tmp_claims_store,
+                        name="ac7-keyerror", allowed=("remix",), denied=("training",))
+    good = tmp_claims_store.list_use_terms_for_subject(WORK)[0]
+    assert claims.verify_use_terms_row(good, log=tmp_log, registry=tmp_registry).ok is True
+
+    for key in ("subject", "declared_by", "allowed_uses", "denied_uses", "scope", "revokes", "note"):
+        row = dict(good)
+        del row[key]
+        vr = claims.verify_use_terms_row(row, log=tmp_log, registry=tmp_registry)
+        assert vr.ok is False, f"a row missing {key!r} must not verify ok"
+        assert vr.failure_mode == "malformed_uses_json", (
+            f"a row missing {key!r} must name the failure, got {vr.failure_mode!r}"
+        )
+        assert vr.payload is None and vr.envelope is None
+
+
 def test_ac7_hash_mismatch_is_named_not_silent(tmp_path, tmp_log, tmp_registry, tmp_claims_store):
     s, result = _declare(tmp_path, tmp_log, tmp_registry, tmp_claims_store, name="ac7-hm")
     row = tmp_claims_store.list_use_terms_for_subject(WORK)[0]

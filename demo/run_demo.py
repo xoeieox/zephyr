@@ -228,7 +228,9 @@ def run_demo(
         captured_run.add_actor("rafiki", "Rafiki", "responder", "Open Payments · interledger-test.dev")
         captured_run.add_actor("crawler", "Training bot", "entity", "third-party consumer (synthetic)")
         captured_run.add_artifact("smiley", "smiley.png", "image/png", manifest_original, "original")
-        captured_run.add_artifact("hat-remix", "smiley-hat.png", "image/png", manifest_remix, "remix - original + hat", derived_from=manifest_original)
+        # hat-remix is registered ONLY when the remix actually proceeds (Act 2's
+        # consent gate): a capture-doc that names an artifact that was never
+        # deposited documents a thing that does not exist.
 
     results = {
         "contributors": [],
@@ -396,6 +398,8 @@ def run_demo(
     prov_b = None
     if remix_proceeds:
         prov_b = make_signed_deposit(attr_log, signer_b, contrib_b["name"], manifest_remix, pubkey_id_b, derived_from=manifest_original, registry=registry)
+        if captured_run:
+            captured_run.add_artifact("hat-remix", "smiley-hat.png", "image/png", manifest_remix, "remix - original + hat", derived_from=manifest_original)
         results["contributors"].append({
             "name": contrib_b["name"],
             "manifest_hash": manifest_remix,
@@ -471,15 +475,30 @@ def run_demo(
             has_wallet=True,
             role="purchaser",
         )
-        scene_log.emit("user", "settler", "purchase", "C purchases the hat product", {
-            "artifact": "hat-remix",
-            "manifest_hash": manifest_remix[:20] + "…",
-            "note": "a real purchase is the occasion for value to move",
-        }, t=0)
-        scene_log.emit("settler", "settler", "chain", "walk the attribution chain", {
-            "chain": ["User B - hat-remix", "User A - original (derived_from)"],
-            "note": "both are attributed",
-        }, t=550)
+        # The hat-remix references below are gated emit-time on prov_b: when
+        # Act 2's consent gate skipped the remix, nothing was deposited, so the
+        # capture-doc must not name an artifact that was never made.
+        if prov_b is not None:
+            scene_log.emit("user", "settler", "purchase", "C purchases the hat product", {
+                "artifact": "hat-remix",
+                "manifest_hash": manifest_remix[:20] + "…",
+                "note": "a real purchase is the occasion for value to move",
+            }, t=0)
+        else:
+            scene_log.emit("user", "settler", "purchase", "C goes to buy the hat product - there is none", {
+                "manifest_hash": manifest_remix[:20] + "…",
+                "note": "the remix was never deposited (the use report was not permitted) - a purchase needs an artifact that exists",
+            }, t=0)
+        if prov_b is not None:
+            scene_log.emit("settler", "settler", "chain", "walk the attribution chain", {
+                "chain": ["User B - hat-remix", "User A - original (derived_from)"],
+                "note": "both are attributed",
+            }, t=550)
+        else:
+            scene_log.emit("settler", "settler", "chain", "walk the attribution chain", {
+                "chain": ["User A - original"],
+                "note": "only the original is attributed - the remix was never made",
+            }, t=550)
         scene_log.emit("settler", "settler", "policy", "void SplitPolicy", {
             "policy": "VOID",
             "asserts": "no claim on the correct share between User A and User B",
