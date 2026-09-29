@@ -598,11 +598,14 @@ def reverify_leg(manifest, leg, *, store=None, log=None, registry=None) -> dict:
         rows = st.list_wallet_bindings_for_subject(bpid)
         if rows:
             latest = max(rows, key=lambda r: r["seq"])
-            if latest["revokes"]:
-                return {"payable": False, "wallet_address": None, "reason": "binding_revoked"}
+            # Verify first, then read the revocation verdict off the VERIFIED
+            # payload: an unverifiable row must never be classified
+            # "binding_revoked" on unverified data.
             vr = verify_wallet_binding_row(latest, log=lg, registry=reg)
             if not vr.ok:
                 return {"payable": False, "wallet_address": None, "reason": "binding_unverified"}
+            if vr.payload["wallet_binding"]["revokes"]:
+                return {"payable": False, "wallet_address": None, "reason": "binding_revoked"}
         return {"payable": False, "wallet_address": None, "reason": "binding_unverified"}
 
     if fresh_address != leg.get("wallet_address"):

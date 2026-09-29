@@ -1,9 +1,20 @@
-# Zephyr Demo: 3-Act Purchase Model with Settlement
+# Zephyr Demo: 4-Scene Purchase Model with Settlement
 
-This demo captures a complete attribution and settlement flow using a 3-act narrative:
-1. **Act 1** — User A deposits the original image (no wallet → no-route, fully credited)
-2. **Act 2** — User B remixes it, declaring `derived_from` the original (has wallet, no settlement yet)
-3. **Act 3** — User C purchases the remix → settlement flow executes, routing value to User B via Open Payments
+This demo captures a complete attribution and settlement flow in four scenes
+(the emitted `run.id` is still `run-3act-demo`, named before the consent scene
+was added):
+1. **Act 1** - User A deposits the original image (no wallet -> no-route, fully credited)
+2. **Act 1b** - User A signs a revocable use declaration on the original
+   (`consent_declaration` / `consent_report` emits), and the synthetic crawler
+   consults the report as its own beat
+3. **Act 2** - User B remixes it, declaring `derived_from` the original, but only
+   when the use report for the remix says `permitted` (has wallet, no settlement yet)
+4. **Act 3** - User C purchases the remix -> settlement flow executes, routing value
+   to User B via Open Payments
+
+Acts 2 and 3 are consent-gated: when the remix is not reported `permitted` it is
+never deposited (Act 2 emits a single `consent_skip` beat instead of the deposit),
+`hat-remix` is never registered as an artifact, and Act 3 settles nothing.
 
 ## Quick Start (Deterministic Dry-Run)
 
@@ -26,10 +37,11 @@ A real settlement against `wallet.interledger-test.dev` (the public Interledger 
 
 ### Prerequisites
 
-1. **Image files** — two real PNG files:
+1. **Image files** - two real PNG files:
    ```
-   original.png       # Act 1 & Act 2 reference
-   remix.png          # Act 2 artifact + Act 3 purchase target
+   original.png       # Act 1 & Act 1b reference
+   remix.png          # Act 2 artifact + Act 3 purchase target (only when the
+                      # remix is reported "permitted" and actually proceeds)
    ```
    The system computes real SHA256 hashes and records them in the event-log.
 
@@ -70,7 +82,9 @@ python demo/run_demo.py \
 
 The demo will:
 1. Compute real SHA256 hashes from image files.
-2. Register both images as artifacts with `derived_from` lineage.
+2. Register the original as an artifact, and register `hat-remix` with
+   `derived_from` lineage only when Act 2's consent gate lets the remix proceed
+   (a skipped remix is never named in the capture doc).
 3. Execute the real Open Payments flow against `wallet.interledger-test.dev`.
 4. **Pause and display the approval URL** when User C's outgoing-payment grant requires interactive approval.
 5. Continue after operator approval and complete settlement.
@@ -96,9 +110,9 @@ The current `settler/op_flow.py` uses unsigned `httpx` calls to the Open Payment
 
 **Impact:** The live-capture path will fail with HTTP 401 on real `wallet.interledger-test.dev` API calls.
 
-**Workaround for deterministic reliability (Saturday lock):** Use `--dry-run --emit-json`, which produces a valid schema-1.2 event-log with synthetic OP/GNAP events. This is the **guaranteed-shippable tier** for the video.
+**Workaround for deterministic reliability:** Use `--dry-run --emit-json`, which produces a valid schema-1.2 event-log with synthetic OP/GNAP events. This is the **guaranteed-shippable tier** for the video.
 
-**TODO (best-effort, Sunday deadline):** 
+**TODO (best-effort, open):**
 - Integrate a maintained Open Payments client (e.g., `@interledger/open-payments` via Node.js helper, or a Python OP SDK).
 - Add HTTP Message Signature support.
 - Re-test live capture and update this README with success confirmation.
@@ -119,37 +133,53 @@ Both dry-run and live captures emit a JSON event-log conforming to `schema_versi
     "inter_scene_gap_ms": 2200
   },
   "actors": [
-    { "id": "user", "display": "User", "role": "entity", ... },
-    { "id": "settler", "display": "Settler", "role": "entity", ... },
-    { "id": "rafiki", "display": "Rafiki", "role": "responder", ... }
+    { "id": "user", "label": "User", "kind": "entity", ... },
+    { "id": "settler", "label": "Settler", "kind": "entity", ... },
+    { "id": "rafiki", "label": "Rafiki", "kind": "responder", ... },
+    { "id": "crawler", "label": "Training bot", "kind": "entity", ... }
   ],
   "artifacts": [
-    { "id": "smiley", "filename": "smiley.png", "manifest_hash": "sha256:...", "role": "original" },
-    { "id": "hat-remix", "filename": "...", "manifest_hash": "sha256:...", "derived_from": "sha256:...", "role": "remix" }
+    { "id": "smiley", "filename": "smiley.png", "media_type": "image/png", "manifest_hash": "sha256:...", "caption": "original" },
+    { "id": "hat-remix", "filename": "smiley-hat.png", "media_type": "image/png", "manifest_hash": "sha256:...", "caption": "remix - original + hat", "derived_from": "sha256:..." }
   ],
   "scenes": [
     {
       "id": "act-1-deposit",
       "title": "User A deposits the original",
       "outcome": "attributed",
-      "user": { "id": "agent:contributor_01", "display": "User A", "has_wallet": false },
+      "artifact": "smiley",
+      "user": { "id": "contributor_01", "display": "User A", "role": "depositor", "has_wallet": false },
       "events": [
         { "t": 0, "from": "user", "to": "settler", "kind": "deposit", "label": "...", "detail": {...} },
         ...
       ]
     },
     {
+      "id": "act-1b-consent",
+      "title": "User A declares use terms on the original",
+      "outcome": "attributed",
+      "artifact": "smiley",
+      "user": { "id": "contributor_01", "display": "User A", "role": "declarator", "has_wallet": false },
+      "events": [
+        { "t": 0, "from": "user", "to": "settler", "kind": "consent_declaration", "label": "A signs what may be done with the work", "detail": {...} },
+        { "t": 550, "from": "settler", "to": "settler", "kind": "consent_report", "label": "the machine reports what was declared, nothing more", "detail": {...} },
+        { "t": 1100, "from": "crawler", "to": "settler", "kind": "consent_check", "label": "third-party training bot consults the use report", "detail": {...} }
+      ]
+    },
+    {
       "id": "act-2-remix",
       "title": "User B remixes it",
       "outcome": "attributed",
-      "user": { "id": "agent:contributor_02", "display": "User B", "has_wallet": true },
+      "artifact": "hat-remix",
+      "user": { "id": "contributor_02", "display": "User B", "role": "remixer", "has_wallet": true },
       "events": [ ... ]
     },
     {
       "id": "act-3-purchase",
-      "title": "User C buys the remix",
+      "title": "User C buys the remix - money moves",
       "outcome": "settled",
-      "user": { "id": "agent:contributor_03", "display": "User C", "has_wallet": true },
+      "artifact": "hat-remix",
+      "user": { "id": "contributor_03", "display": "User C", "role": "purchaser", "has_wallet": true },
       "events": [
         { "kind": "purchase", ... },
         { "kind": "op_request", ... },
@@ -163,8 +193,8 @@ Both dry-run and live captures emit a JSON event-log conforming to `schema_versi
     }
   ],
   "ledger": [
-    { "user": "User A", "artifact": "smiley", "status": "no-route", "record": "the record stands", ... },
-    { "user": "User B", "artifact": "hat-remix", "status": "settled", "amount": 1, "op_payment_id": "op_...", ... }
+    { "user": "User B", "artifact": "hat-remix", "status": "settled", "amount": 1, "asset_code": "USD", "op_payment_id": "op_...", "attribution": "fully credited", "derived_from": "User A" },
+    { "user": "User A", "artifact": "smiley", "status": "no-route", "amount": null, "asset_code": "USD", "op_payment_id": null, "attribution": "fully credited", "record": "the record stands" }
   ],
   "void_principle": {
     "policy": "VOID",
@@ -177,6 +207,15 @@ Both dry-run and live captures emit a JSON event-log conforming to `schema_versi
 
 ## Testing the Output
 
+Two parts of the document above are conditional rather than fixed, and readers
+comparing captures should expect them to disappear on a skipped run: the
+`hat-remix` artifact is registered only when Act 2's consent gate lets the
+remix proceed, and User B's `settled` ledger row is appended only when the
+remix actually settles. User A's `no-route` row and the four scenes are always
+present. On a skipped run the `act-2-remix` title also changes (its title
+becomes "User B's remix is not made - the use report is not permitted") and its
+only event is the `consent_skip` beat.
+
 Validate the emitted JSON against the schema:
 
 ```bash
@@ -185,7 +224,10 @@ import json
 doc = json.load(open('/tmp/capture-mock.json'))
 assert doc['schema_version'] == '1.2', 'Wrong schema'
 assert 'run' in doc and 'actors' in doc and 'artifacts' in doc, 'Missing top-level keys'
-assert len(doc['scenes']) == 3, f'Expected 3 acts, got {len(doc[\"scenes\"])}'
+assert len(doc['scenes']) == 4, f'Expected 4 scenes, got {len(doc[\"scenes\"])}'
+consent = next(s for s in doc['scenes'] if s['id'] == 'act-1b-consent')
+consent_kinds = {e['kind'] for e in consent['events']}
+assert {'consent_declaration', 'consent_report', 'consent_check'} <= consent_kinds, consent_kinds
 act3 = next(s for s in doc['scenes'] if s['id'] == 'act-3-purchase')
 act3_kinds = {e['kind'] for e in act3['events']}
 assert 'op_request' in act3_kinds, 'Missing op_request events'
@@ -221,5 +263,5 @@ Verify that:
 ---
 
 **Contact:** Zephyr protocol; attribution + settlement flow  
-**Last updated:** 2026-06-12  
+**Last updated:** 2026-09-29  
 **Schema:** 1.2

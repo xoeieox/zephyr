@@ -1419,10 +1419,15 @@ def resolve_wallet(
     if not result.ok:
         return None
 
-    if latest["revokes"]:
+    # Read the revocation verdict off the VERIFIED payload, not the raw column,
+    # honoring this function's own pinned law: every verdict field comes from
+    # the verified ClaimIntegrityResult.payload.
+    body = result.payload["wallet_binding"]
+
+    if body["revokes"]:
         return None
 
-    return latest["wallet_address"]
+    return body["wallet_address"]
 
 
 # ---------------------------------------------------------------------------

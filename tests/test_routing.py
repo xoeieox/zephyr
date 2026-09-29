@@ -1115,6 +1115,110 @@ def test_u2a_ac8_reverify_leg_refuses_stale_routable(tmp_path, tmp_log, tmp_regi
     assert outcome2["wallet_address"] == "https://wallet.example/u2aac8-d-NEW"
 
 
+def test_u2a_ac8_reverify_leg_unverified_row_gets_no_named_verdict(
+    tmp_path, tmp_log, tmp_registry, tmp_claims_store
+):
+    # H2 coverage (a): binding rows ARE present but the integrity bind FAILS
+    # and the raw revokes cell is False - the verdict must be the generic
+    # "binding_unverified", never a named verdict derived from unverified data.
+    d = _contributor(tmp_path, tmp_registry, "u2aac8u-d")
+    compiler = _signer(tmp_path, "u2aac8u-compiler")
+
+    subject_mh = _make_content_deposit(
+        tmp_log, d, tmp_registry, agent_id="agent:u2aac8u-d", payload={"work": "x"},
+        summary="work x", timestamp="2026-07-20T00:00:00+00:00",
+    )
+    claims.record_routing_terms(
+        subject=subject_mh, beneficiary_pubkey_id=d.pubkey_id_str, share_bps=4000,
+        scope="standing", declared_by="agent:u2aac8u-d", agent_id="agent:u2aac8u-d",
+        signer=d, registry=tmp_registry, recorder=tmp_log, timestamp="2026-07-20T00:00:01+00:00",
+    )
+    claims.record_wallet_binding(
+        subject=d.pubkey_id_str, wallet_address="https://wallet.example/u2aac8u-d",
+        agent_id="agent:u2aac8u-d", signer=d, registry=tmp_registry, recorder=tmp_log,
+        timestamp="2026-07-20T00:00:02+00:00",
+    )
+
+    result = compile_route_manifest(
+        event_kind="demo-sale", event_ref="evt-u2aac8u", subject=subject_mh,
+        amount_value=500, asset_code="USD", asset_scale=2,
+        agent_id="agent:route-test", log=tmp_log, registry=tmp_registry, signer=compiler,
+        timestamp="2026-07-20T00:01:00+00:00",
+    )
+    manifest = result["manifest"]["route_manifest"]
+    leg = next(l for l in manifest["legs"] if l["beneficiary_pubkey_id"] == d.pubkey_id_str)
+    assert leg["leg_status"] == "routable"
+
+    rows = tmp_claims_store.list_wallet_bindings_for_subject(d.pubkey_id_str)
+    assert rows and all(r["revokes"] == 0 for r in rows)
+
+    # Break the integrity bind WITHOUT touching the revokes cell: the stored
+    # columns no longer reproduce the committed manifest_hash.
+    tmp_claims_store._conn.execute(
+        "UPDATE wallet_bindings SET note = 'flipped' WHERE manifest_hash = ?",
+        (max(rows, key=lambda r: r["seq"])["manifest_hash"],),
+    )
+    tmp_claims_store._conn.commit()
+
+    outcome = reverify_leg(manifest, leg, store=tmp_claims_store, log=tmp_log, registry=tmp_registry)
+    assert outcome == {"payable": False, "wallet_address": None, "reason": "binding_unverified"}
+
+
+def test_u2a_ac8_reverify_leg_tampered_revokes_cell_is_unverified_not_revoked(
+    tmp_path, tmp_log, tmp_registry, tmp_claims_store
+):
+    # H2 coverage (b), the pinned behavior delta: a row whose RAW revokes cell
+    # is set but which FAILS the integrity bind must report
+    # "binding_unverified", NOT "binding_revoked". Unverified data produces no
+    # named verdict - the fail-closed direction.
+    d = _contributor(tmp_path, tmp_registry, "u2aac8t-d")
+    compiler = _signer(tmp_path, "u2aac8t-compiler")
+
+    subject_mh = _make_content_deposit(
+        tmp_log, d, tmp_registry, agent_id="agent:u2aac8t-d", payload={"work": "x"},
+        summary="work x", timestamp="2026-07-20T00:00:00+00:00",
+    )
+    claims.record_routing_terms(
+        subject=subject_mh, beneficiary_pubkey_id=d.pubkey_id_str, share_bps=4000,
+        scope="standing", declared_by="agent:u2aac8t-d", agent_id="agent:u2aac8t-d",
+        signer=d, registry=tmp_registry, recorder=tmp_log, timestamp="2026-07-20T00:00:01+00:00",
+    )
+    claims.record_wallet_binding(
+        subject=d.pubkey_id_str, wallet_address="https://wallet.example/u2aac8t-d",
+        agent_id="agent:u2aac8t-d", signer=d, registry=tmp_registry, recorder=tmp_log,
+        timestamp="2026-07-20T00:00:02+00:00",
+    )
+
+    result = compile_route_manifest(
+        event_kind="demo-sale", event_ref="evt-u2aac8t", subject=subject_mh,
+        amount_value=500, asset_code="USD", asset_scale=2,
+        agent_id="agent:route-test", log=tmp_log, registry=tmp_registry, signer=compiler,
+        timestamp="2026-07-20T00:01:00+00:00",
+    )
+    manifest = result["manifest"]["route_manifest"]
+    leg = next(l for l in manifest["legs"] if l["beneficiary_pubkey_id"] == d.pubkey_id_str)
+    assert leg["leg_status"] == "routable"
+
+    latest = max(
+        tmp_claims_store.list_wallet_bindings_for_subject(d.pubkey_id_str),
+        key=lambda r: r["seq"],
+    )
+    # Flip the revokes cell directly in the domain table: the raw cell now says
+    # "revoked", but the committed manifest_hash no longer covers it, so the
+    # integrity bind fails.
+    tmp_claims_store._conn.execute(
+        "UPDATE wallet_bindings SET revokes = 1 WHERE manifest_hash = ?",
+        (latest["manifest_hash"],),
+    )
+    tmp_claims_store._conn.commit()
+
+    outcome = reverify_leg(manifest, leg, store=tmp_claims_store, log=tmp_log, registry=tmp_registry)
+    assert outcome["payable"] is False
+    assert outcome["reason"] == "binding_unverified"
+    assert outcome["reason"] != "binding_revoked"
+    assert outcome["wallet_address"] is None
+
+
 # ---------------------------------------------------------------------------
 # AC9 -- is_current_head catches mid-run supersession (D4)
 # ---------------------------------------------------------------------------
