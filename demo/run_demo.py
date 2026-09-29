@@ -228,7 +228,7 @@ def run_demo(
         captured_run.add_actor("rafiki", "Rafiki", "responder", "Open Payments · interledger-test.dev")
         captured_run.add_actor("crawler", "Training bot", "entity", "third-party consumer (synthetic)")
         captured_run.add_artifact("smiley", "smiley.png", "image/png", manifest_original, "original")
-        captured_run.add_artifact("hat-remix", "smiley-hat.png", "image/png", manifest_remix, "remix — original + hat", derived_from=manifest_original)
+        captured_run.add_artifact("hat-remix", "smiley-hat.png", "image/png", manifest_remix, "remix - original + hat", derived_from=manifest_original)
 
     results = {
         "contributors": [],
@@ -279,7 +279,7 @@ def run_demo(
         scene_log.emit("settler", "settler", "attribution", "attribution established", {
             "attributed_to": "User A",
             "manifest_hash": manifest_original[:20] + "…",
-            "note": "the record stands — no money moves on a deposit",
+            "note": "the record stands - no money moves on a deposit",
         }, t=550)
 
     # ========================================================================
@@ -362,19 +362,19 @@ def run_demo(
             "declared_by": (consent_record or {}).get("pubkey_id", signer_a.pubkey_id_str)[:20] + "…",
             "allowed_uses": list(consent_cfg["allowed_uses"]),
             "denied_uses": list(consent_cfg["denied_uses"]),
-            "note": "self-declared only — declared_by is attribution of the declaration, never proof of entitlement",
+            "note": "self-declared only - declared_by is attribution of the declaration, never proof of entitlement",
         }, t=0)
         scene_log.emit("settler", "settler", "consent_report", "the machine reports what was declared, nothing more", {
             "remix": remix_use,
             "training": training_use,
             "vocabulary": list(zephyr_claims.USE_VOCAB),
-            "note": "permitted | denied | undeclared — undeclared is the permission-void, never permission",
+            "note": "permitted | denied | undeclared - undeclared is the permission-void, never permission",
         }, t=550)
         scene_log.emit("crawler", "settler", "consent_check", "third-party training bot consults the use report", {
             "use": "training",
             "report": training_use,
             "action": "proceed" if training_use == "permitted" else "skip",
-            "note": "the consumer decides what undeclared means — Zephyr never does",
+            "note": "the consumer decides what undeclared means - Zephyr never does",
         }, t=1100)
 
     # ========================================================================
@@ -405,7 +405,7 @@ def run_demo(
     else:
         # Consumer law, decided by the consumer (never by Zephyr): a remix not
         # reported "permitted" is skipped. "denied" and "undeclared" are both
-        # conservative here — undeclared is never permission.
+        # conservative here - undeclared is never permission.
         log.info(
             "Remix skipped: the use report for the remix was %r (this consumer's default is conservative)",
             remix_use,
@@ -414,7 +414,7 @@ def run_demo(
 
     if captured_run:
         scene_log = captured_run.start_scene("act-2-remix")
-        scene_log.set_title("User B remixes it" if remix_proceeds else "User B's remix is not made — the use report is not permitted")
+        scene_log.set_title("User B remixes it" if remix_proceeds else "User B's remix is not made - the use report is not permitted")
         scene_log.set_outcome("attributed")
         scene_log.set_contributor(
             f"agent:{contrib_b['name']}",
@@ -433,12 +433,12 @@ def run_demo(
             scene_log.emit("settler", "settler", "lineage", "attribution travels", {
                 "derived_from": manifest_original[:20] + "…",
                 "from_user": "User A",
-                "note": "B's remix links back to A's original — and gets its own hash",
+                "note": "B's remix links back to A's original - and gets its own hash",
             }, t=550)
             scene_log.emit("settler", "settler", "attribution", "attribution established", {
                 "attributed_to": "User B",
                 "manifest_hash": manifest_remix[:20] + "…",
-                "note": "still no money — attribution only",
+                "note": "still no money - attribution only",
             }, t=1100)
         else:
             scene_log.emit("settler", "settler", "consent_skip", "remix not deposited", {
@@ -463,7 +463,7 @@ def run_demo(
 
     if captured_run:
         scene_log = captured_run.start_scene("act-3-purchase")
-        scene_log.set_title("User C buys the remix — money moves")
+        scene_log.set_title("User C buys the remix - money moves")
         scene_log.set_outcome("settled")  # Act 3 is the settlement act
         scene_log.set_contributor(
             f"agent:{contrib_c['name']}",
@@ -477,7 +477,7 @@ def run_demo(
             "note": "a real purchase is the occasion for value to move",
         }, t=0)
         scene_log.emit("settler", "settler", "chain", "walk the attribution chain", {
-            "chain": ["User B — hat-remix", "User A — original (derived_from)"],
+            "chain": ["User B - hat-remix", "User A - original (derived_from)"],
             "note": "both are attributed",
         }, t=550)
         scene_log.emit("settler", "settler", "policy", "void SplitPolicy", {
@@ -485,12 +485,12 @@ def run_demo(
             "asserts": "no claim on the correct share between User A and User B",
         }, t=1100)
         scene_log.emit("settler", "settler", "route", "who has a wallet at transaction time?", {
-            "User B": "wallet ✓ — will receive",
-            "User A": "no wallet ✗ — credited, unpaid",
+            "User B": "wallet ✓ - will receive",
+            "User A": "no wallet ✗ - credited, unpaid",
         }, t=1650)
 
     # Zephyr does not mint payment claims (decision/zephyr-stops-minting-
-    # payment-claims-2026-08-11) — record() no longer auto-enqueues a
+    # payment-claims-2026-08-11) - record() no longer auto-enqueues a
     # settlement intent for every signed deposit. Act 3's purchase is
     # exactly the explicit, declared dry run R3 of that decision asks for:
     # a real purchase event just occurred, so the demo declares the intent
@@ -500,7 +500,7 @@ def run_demo(
     if prov_b is not None:
         intent_queue.append(manifest_remix, prov_b)
     else:
-        log.info("No remix deposit exists (the consent report was not 'permitted') — nothing to settle")
+        log.info("No remix deposit exists (the consent report was not 'permitted') - nothing to settle")
 
     # Run settler
     settler = Settler(
@@ -539,7 +539,7 @@ def run_demo(
                     "body": {"receiver": "ip_9f3a2b", "method": "ilp"},
                 }, t=3100)
 
-                scene_log.emit("rafiki", "settler", "op_response", "201 quote — $0.01", {
+                scene_log.emit("rafiki", "settler", "op_response", "201 quote - $0.01", {
                     "status": 201,
                     "body": {"id": "qt_4c7e", "receiveAmount": {"value": "1", "assetCode": "USD", "assetScale": 2}},
                 }, t=3550)
@@ -559,7 +559,7 @@ def run_demo(
 
                 scene_log.emit("user", "rafiki", "grant_approval", "C approves the payment", {
                     "approved": True,
-                    "note": "captured once — the Open Payments consent moment",
+                    "note": "captured once - the Open Payments consent moment",
                 }, t=5000)
 
                 scene_log.emit("rafiki", "settler", "grant_response", "access_token granted", {
@@ -580,7 +580,7 @@ def run_demo(
                 }, t=6450)
 
                 # Ledger records
-                scene_log.emit("settler", "settler", "ledger", "record settled — User B", {
+                scene_log.emit("settler", "settler", "ledger", "record settled - User B", {
                     "user": "User B",
                     "status": "settled",
                     "amount": 1,
@@ -589,7 +589,7 @@ def run_demo(
                     "attribution": "fully credited",
                 }, t=7000)
 
-                scene_log.emit("settler", "settler", "ledger", "record no-route — User A", {
+                scene_log.emit("settler", "settler", "ledger", "record no-route - User A", {
                     "user": "User A",
                     "status": "no-route",
                     "amount": None,
@@ -641,11 +641,11 @@ def run_demo(
     log.info("\n--- Settlement Ledger ---")
     print("\n")
     print("=" * 80)
-    print("SETTLEMENT LEDGER — VOID PRINCIPLE")
+    print("SETTLEMENT LEDGER - VOID PRINCIPLE")
     print("=" * 80)
     print()
     print("⚠️  VOID LINE")
-    print("SplitPolicy: VOID — this system makes no claim about the correct share.")
+    print("SplitPolicy: VOID - this system makes no claim about the correct share.")
     print("The livelihood gap is the unsolved problem.")
     print()
     print("All contributors below are fully credited, regardless of settlement status.")
@@ -662,7 +662,7 @@ def run_demo(
     for row in rows:
         pubkey_id = row["pubkey_id"]
         status = row["status"]
-        amount_str = "—" if status == "no-route" or not row["amount"] else f"${row['amount'] / 100:.2f}"
+        amount_str = "-" if status == "no-route" or not row["amount"] else f"${row['amount'] / 100:.2f}"
         user_name = contrib_map.get(pubkey_id, f"Unknown ({pubkey_id[:18]})")
         print(f"{user_name:<20} {status:<12} {amount_str:<10} fully credited")
 
@@ -676,8 +676,8 @@ def run_demo(
     if captured_run:
         captured_run.void_principle = {
             "policy": "VOID",
-            "statement": "SplitPolicy VOID — Zephyr makes no claim about the correct share between User A and User B.",
-            "record_not_money": "Money routes only to attributed creators who have a wallet linked at transaction time. User A has none, so User A is credited but unpaid — and there is no retroactive backfill. Zephyr guarantees the RECORD, never deferred money.",
+            "statement": "SplitPolicy VOID - Zephyr makes no claim about the correct share between User A and User B.",
+            "record_not_money": "Money routes only to attributed creators who have a wallet linked at transaction time. User A has none, so User A is credited but unpaid - and there is no retroactive backfill. Zephyr guarantees the RECORD, never deferred money.",
             "coda": "The livelihood gap is the unsolved problem.",
         }
         captured_run.write_json(emit_json_path)

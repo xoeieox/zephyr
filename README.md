@@ -37,41 +37,41 @@ What shipped in v0:
 
 - **Signed self-declarations over a closed vocabulary** `{training, remix,
   redistribution}`: `record_use_terms(subject=..., allowed_uses=[...],
-  denied_uses=[...])` — a key declares only for itself (the declarant is
+  denied_uses=[...])` - a key declares only for itself (the declarant is
   derived from the signer; there is no parameter with which to declare on
   another party's behalf), and every verdict-affecting field lives inside the
   signed envelope.
 - **Tri-state reporting**: `check_use(subject, use)` answers exactly one of
   `permitted`, `denied`, or `undeclared`. A use not covered by the active
-  declaration is `undeclared` — never silently permitted, never silently
+  declaration is `undeclared` - never silently permitted, never silently
   denied. The machine makes no claim about what you may do; it proves what was
   declared, and the absence of a declaration is itself visible. What
-  `undeclared` means for your activity is your call as the consumer — Zephyr
+  `undeclared` means for your activity is your call as the consumer - Zephyr
   never decides it for you, and `undeclared` is never permission and is never
   treated more permissively than a prior `denied` declaration on the same
   work.
 - **Revocation without erasure**: a later declaration with `revokes=True`
   withdraws the active one (it declares nothing itself); rows are never
   updated or deleted, so what was true while consent stood stays verifiable
-  forever. After revocation the report is `undeclared`, not `denied` —
+  forever. After revocation the report is `undeclared`, not `denied` -
   consent withdrawn is not consent to refuse.
 - **Merkle-auditable**: every declaration rides the transparency log as a
   signed deposit; a domain row whose deposit was tampered with surfaces as a
   loud named failure, never a silent absence.
 
-`declared_by` is attribution of the declaration, never proof of entitlement —
+`declared_by` is attribution of the declaration, never proof of entitlement -
 disputes go to the social layer. Any registered key can sign a declaration
 over any work hash, so consumers must cross-check `declared_by` against the
 work's creator before honoring `permitted`: the machine reports WHO declared,
 never who was entitled.
 
 Do not confuse this with the Open-Payments payment-grant "consent" beats in
-`demo/README.md` (the GNAP approval moment in act 3) — that word-sense is a
+`demo/README.md` (the GNAP approval moment in act 3) - that word-sense is a
 payment grant; the consent described here is a signed use declaration, and
 the two are decoupled by design (a use declaration never gates a payment
 leg).
 
-Never populate `note` with personal data — it is signed into the public
+Never populate `note` with personal data - it is signed into the public
 envelope, and the privacy guarantee rests on synthetic-identity discipline,
 not on this rail.
 
