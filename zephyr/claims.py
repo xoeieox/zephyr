@@ -39,6 +39,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -60,18 +61,29 @@ __all__ = [
     "RouteChainError",
     "RouteReceiptError",
     "ClaimIntegrityResult",
+    "USE_VOCAB",
     "get_claims_store",
     "record_wallet_binding",
     "record_routing_terms",
     "record_route_receipt",
+    "record_use_terms",
     "resolve_wallet",
+    "resolve_use_terms",
+    "check_use",
     "route_receipts_for_manifest",
     "verify_claim",
     "verify_wallet_binding_row",
     "verify_routing_terms_row",
     "verify_route_manifest_row",
     "verify_route_receipt_row",
+    "verify_use_terms_row",
 ]
+
+# Closed vocabulary of use declarations (rail zephyr-use-terms-consent-v0, DD3).
+# A declaration may only allow/deny tokens from this tuple; anything else is
+# rejected at declare time. The machine REPORTS declarations - it settles
+# nothing about permission.
+USE_VOCAB: tuple[str, ...] = ("training", "remix", "redistribution")
 
 DEFAULT_CLAIMS_DB = Path(os.environ.get("ZEPHYR_CLAIMS_DB", "/data/zephyr/claims.db"))
 
@@ -137,6 +149,21 @@ CREATE INDEX IF NOT EXISTS route_receipts_manifest ON route_receipts(manifest_ha
 CREATE UNIQUE INDEX IF NOT EXISTS route_receipts_terminal_unique
     ON route_receipts(manifest_hash, beneficiary_pubkey_id)
     WHERE outcome IN ('settled', 'skipped');
+
+CREATE TABLE IF NOT EXISTS use_terms (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    manifest_hash   TEXT NOT NULL UNIQUE,
+    subject         TEXT NOT NULL,
+    declared_by     TEXT NOT NULL,
+    allowed_uses    TEXT NOT NULL,
+    denied_uses     TEXT NOT NULL DEFAULT '[]',
+    scope           TEXT NOT NULL,
+    revokes         INTEGER NOT NULL DEFAULT 0,
+    note            TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL,
+    recorded_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS use_terms_subject ON use_terms(subject);
 """
 
 # Rebuild specs for the D1b seq-column migration. SQLite forbids adding an
@@ -859,6 +886,110 @@ class ClaimsStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # -- use_terms (rail zephyr-use-terms-consent-v0) ------------------------
+
+    def insert_use_terms(
+        self,
+        *,
+        manifest_hash: str,
+        subject: str,
+        declared_by: str,
+        allowed_uses: list[str],
+        denied_uses: list[str],
+        scope: str,
+        revokes: bool,
+        note: str,
+        summary: str,
+        recorded_at: str,
+    ) -> None:
+        """Insert a use_terms domain row, LOUD on conflict (mirrors
+        insert_route_manifest's pattern, NOT INSERT OR IGNORE).
+
+        Re-inserting byte-identical content is an explicit no-op checked
+        BEFORE the write (idempotent re-record). An existing row at the same
+        manifest_hash with ANY differing column means a schema guarantee was
+        violated: sqlite3.IntegrityError is re-raised, never absorbed - bare
+        OR IGNORE would let a pre-seeded row at a predictable future envelope
+        hash silently swallow the real declaration. `seq` is store-assigned
+        (AUTOINCREMENT) and never caller-settable.
+        """
+        allowed_json = json.dumps(list(allowed_uses), separators=(",", ":"), sort_keys=True)
+        denied_json = json.dumps(list(denied_uses), separators=(",", ":"), sort_keys=True)
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT * FROM use_terms WHERE manifest_hash = ?", (manifest_hash,)
+            ).fetchone()
+            if existing is not None:
+                row = dict(existing)
+                same = (
+                    row["subject"] == subject
+                    and row["declared_by"] == declared_by
+                    and row["allowed_uses"] == allowed_json
+                    and row["denied_uses"] == denied_json
+                    and row["scope"] == scope
+                    and row["revokes"] == int(bool(revokes))
+                    and row["note"] == note
+                    and row["summary"] == summary
+                    and row["recorded_at"] == recorded_at
+                )
+                if same:
+                    return  # byte-identical re-record: no-op
+                raise sqlite3.IntegrityError(
+                    f"insert_use_terms: a row already exists at manifest_hash={manifest_hash!r} "
+                    f"with differing content - refusing to absorb it"
+                )
+            try:
+                self._conn.execute(
+                    "INSERT INTO use_terms "
+                    "(manifest_hash, subject, declared_by, allowed_uses, denied_uses, scope, "
+                    " revokes, note, summary, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        manifest_hash,
+                        subject,
+                        declared_by,
+                        allowed_json,
+                        denied_json,
+                        scope,
+                        int(bool(revokes)),
+                        note,
+                        summary,
+                        recorded_at,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # A concurrent insert raced us at the same manifest_hash. If
+                # the landed row is byte-identical this is an idempotent
+                # re-record; otherwise the guarantee violation stays loud.
+                landed = self._conn.execute(
+                    "SELECT * FROM use_terms WHERE manifest_hash = ?", (manifest_hash,)
+                ).fetchone()
+                if landed is None:
+                    raise
+                row = dict(landed)
+                same = (
+                    row["subject"] == subject
+                    and row["declared_by"] == declared_by
+                    and row["allowed_uses"] == allowed_json
+                    and row["denied_uses"] == denied_json
+                    and row["scope"] == scope
+                    and row["revokes"] == int(bool(revokes))
+                    and row["note"] == note
+                    and row["summary"] == summary
+                    and row["recorded_at"] == recorded_at
+                )
+                if not same:
+                    raise
+                return
+            self._conn.commit()
+
+    def list_use_terms_for_subject(self, subject: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM use_terms WHERE subject = ?", (subject,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
 
 # ---------------------------------------------------------------------------
 # Singleton factory (parallel to get_recorder() / get_registry() / get_signer())
@@ -1292,6 +1423,375 @@ def resolve_wallet(
         return None
 
     return latest["wallet_address"]
+
+
+# ---------------------------------------------------------------------------
+# use_terms (rail zephyr-use-terms-consent-v0) - signed, revocable use
+# declarations on works. The machine REPORTS declarations; it settles nothing
+# about permission.
+# ---------------------------------------------------------------------------
+
+# The real hash shape this ecosystem produces: "sha256:" + 64 lowercase hex
+# (claims.py's own _compute_manifest_hash, demo/run_demo.py's
+# compute_manifest_hash). Validated BEFORE any decode or DB write; a
+# bare-64-hex gate would reject every real work hash.
+_USE_SUBJECT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+_USE_TERMS_TOOL = "zephyr:use-terms"
+_USE_TERMS_STORE_KIND = "use_terms"
+
+
+def _validate_use_subject(subject: str) -> None:
+    """DD1: subject is the work's manifest_hash - shape "sha256:"+64 lowercase hex.
+
+    Shape, not work-ness: the gate cannot distinguish sha256(email) from the
+    hash of a work, and no existence check runs against attribution.db (the
+    work may live on another node - federation forbids coupling the consent
+    record to the deposit record's presence). A consent record for a
+    nonexistent work is inert, not a defect.
+    """
+    if not isinstance(subject, str) or not _USE_SUBJECT_RE.match(subject):
+        raise ValueError(
+            f"use_terms: subject={subject!r} must be a work manifest_hash - "
+            f"'sha256:' followed by 64 lowercase hex characters"
+        )
+
+
+def _validate_use_tokens(uses: list[str], field: str) -> list[str]:
+    """Closed vocabulary (DD3): every token MUST be in USE_VOCAB."""
+    out = []
+    for tok in uses:
+        if tok not in USE_VOCAB:
+            raise ValueError(
+                f"use_terms: {field} contains {tok!r} which is not in the use "
+                f"vocabulary {USE_VOCAB}"
+            )
+        out.append(tok)
+    return out
+
+
+def _validate_use_scope(scope: str) -> None:
+    """Same grammar as routing_terms (the real check in record_routing_terms):
+    "standing" or "event:<ref>" - and additionally rejects a bare "event:"
+    with an empty ref. v0 stores+hashes scope but never consults it."""
+    if not (scope == "standing" or (isinstance(scope, str) and scope.startswith("event:") and len(scope) > len("event:"))):
+        raise ValueError(
+            f"use_terms: scope={scope!r} must be 'standing' or 'event:<ref>' "
+            f"(with a non-empty ref)"
+        )
+
+
+def _validate_use_declaration(
+    allowed_uses: list[str], denied_uses: list[str], revokes: bool
+) -> tuple[list[str], list[str]]:
+    """DD4/DD5 validator. Applies ONLY to revokes=False rows (DD5's tombstone
+    contract exempts them); tombstones declare nothing and MUST carry two
+    empty lists, so no semantically meaningless permission is ever signed
+    into a tombstone's hash."""
+    if revokes:
+        if allowed_uses or denied_uses:
+            raise ValueError(
+                f"use_terms: a revocation (revokes=True) must declare nothing - "
+                f"allowed_uses and denied_uses must both be empty, got "
+                f"allowed_uses={allowed_uses!r} denied_uses={denied_uses!r}"
+            )
+        return [], []
+
+    allowed = _validate_use_tokens(list(allowed_uses or []), "allowed_uses")
+    denied = _validate_use_tokens(list(denied_uses or []), "denied_uses")
+
+    overlap = set(allowed) & set(denied)
+    if overlap:
+        raise ValueError(
+            f"use_terms: allowed_uses and denied_uses overlap on {sorted(overlap)} - "
+            f"a use cannot be both permitted and denied by one declaration "
+            f"(vocabulary: {USE_VOCAB})"
+        )
+    if not allowed and not denied:
+        raise ValueError(
+            f"use_terms: a declaration must say something - allowed_uses and "
+            f"denied_uses must not both be empty (a revocation is the row that "
+            f"declares nothing; use revokes=True). Vocabulary: {USE_VOCAB}"
+        )
+    return allowed, denied
+
+
+def _use_terms_payload(row: dict) -> dict:
+    """The pinned signed envelope (DD8): every verdict-affecting column is
+    INSIDE the signed envelope - an omitted field would be DB-flippable while
+    verify stays ok. The 4-field wallet sibling is a shape precedent, not a
+    field list."""
+    return {
+        "use_terms": {
+            "subject": row["subject"],
+            "declared_by": row["declared_by"],
+            "allowed_uses": json.loads(row["allowed_uses"]),
+            "denied_uses": json.loads(row["denied_uses"]),
+            "scope": row["scope"],
+            "revokes": bool(row["revokes"]),
+            "note": row["note"] or "",
+        }
+    }
+
+
+def verify_use_terms_row(row: dict, *, log=None, registry=None) -> ClaimIntegrityResult:
+    """Re-verify a use_terms domain row against its deposit envelope.
+
+    Never raises (verify_claim's guarantee): a tampered uses cell that is not
+    valid JSON surfaces as failure_mode="malformed_uses_json" instead of
+    crashing out of the verify path - a crash would be fail-open-by-crash
+    into whatever the consumer's except-block does.
+    """
+    try:
+        payload = _use_terms_payload(row)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ClaimIntegrityResult(False, "malformed_uses_json", None, None)
+    return verify_claim(row, payload, log=log, registry=registry)
+
+
+def record_use_terms(
+    *,
+    subject: str,
+    allowed_uses: list[str],
+    denied_uses: list[str] | None = None,
+    scope: str = "standing",
+    agent_id: str,
+    revokes: bool = False,
+    note: str = "",
+    signer: "AgentSigner | None" = None,
+    registry: "PubkeyRegistry | None" = None,
+    recorder: "AttributionLog | None" = None,
+    timestamp: str | None = None,
+) -> dict:
+    """Record a self-declared use declaration on a work. Returns record_signed's return dict.
+
+    SELF-DECLARED ONLY, STRUCTURALLY (DD2): there is NO declared_by parameter
+    at all - the value is derived internally as the resolved signer's own
+    pubkey_id_str, exactly as record_wallet_binding treats the signer as the
+    only declarant. There is no parameter with which to declare use terms on
+    another party's behalf: the proxy backdoor does not exist by absence of
+    any parameter from which a non-self declared_by could survive.
+
+    *subject* is the work's manifest_hash (DD1 - shape validated before any
+    decode or DB write). *revokes=True* writes an additive tombstone that must
+    carry empty allowed_uses/denied_uses (DD5): it withdraws, it does not
+    redistribute - "credited-but-unpaid, never dropped" applies to the history
+    too, so every prior declaration keeps verifying for its era.
+
+    One signing act, two homes (DD7): the deposit (tool="zephyr:use-terms",
+    store_kind="use_terms", key=subject) is recorded FIRST via record_signed;
+    only then the claims.db domain row, keyed by the consent's OWN envelope
+    hash - never the work hash (the work hash is *subject*).
+    """
+    from zephyr.attribution import record_signed
+    from zephyr.signing import get_signer
+
+    _validate_use_subject(subject)
+    allowed, denied = _validate_use_declaration(
+        list(allowed_uses or []), list(denied_uses or []), bool(revokes)
+    )
+    _validate_use_scope(scope)
+
+    s = signer if signer is not None else get_signer()
+    declared_by = s.pubkey_id_str  # DD2: derived, never caller-supplied
+    revokes = bool(revokes)
+
+    payload = {
+        "use_terms": {
+            "subject": subject,
+            "declared_by": declared_by,
+            "allowed_uses": allowed,
+            "denied_uses": denied,
+            "scope": scope,
+            "revokes": revokes,
+            "note": note,
+        }
+    }
+    summary = (
+        f"use terms revocation for {subject}"
+        if revokes
+        else f"use terms: {subject} allowed={allowed} denied={denied} ({scope})"
+    )
+
+    result = record_signed(
+        payload,
+        agent_id=agent_id,
+        tool=_USE_TERMS_TOOL,
+        store_kind=_USE_TERMS_STORE_KIND,
+        key=subject,
+        signer=s,
+        registry=registry,
+        recorder=recorder,
+        summary=summary,
+        timestamp=timestamp,
+    )
+
+    store = get_claims_store()
+    store.insert_use_terms(
+        manifest_hash=result["manifest_hash"],
+        subject=subject,
+        declared_by=declared_by,
+        allowed_uses=allowed,
+        denied_uses=denied,
+        scope=scope,
+        revokes=revokes,
+        note=note,
+        summary=summary,
+        recorded_at=timestamp or _now_iso(),
+    )
+    return result
+
+
+def _assert_use_terms_deposit_parity(
+    subject: str, deposits: list[dict], domain_rows: list[dict]
+) -> None:
+    """DD7's both-ways deposit-authoritative check.
+
+    Forward (deposit-authoritative): every use_terms deposit for *subject*
+    MUST have its domain row - a deleted domain row for a still-deposited
+    declaration is tamper, not absence.
+
+    Reverse: every domain row MUST have its deposit still tagged
+    (store_kind="use_terms", target_key=subject). Without it, a writer who
+    re-tags a tombstone's deposit and deletes its domain row erases a
+    revocation into a benign "undeclared" - the transparency log cannot see
+    it (leaves cover (seq, manifest_hash) only; store_kind/target_key are
+    plain columns outside Merkle coverage).
+
+    Stated honestly (residual): a writer on BOTH dbs who *re-tags* rather than
+    deletes can still erase a declaration invisibly to this check; Merkle
+    audit detects row deletion, not tag mutation. Reaching that requires a RAW
+    write to attribution.db - the same adversary that can reach the Merkle
+    anchor; artifact self-certification cannot cover its own host.
+    """
+    from zephyr.routing import RouteTamperError  # deferred: routing.py imports claims.py
+
+    domain_by_hash = {r["manifest_hash"]: r for r in domain_rows}
+    for dep in deposits:
+        mh = dep["manifest_hash"]
+        if mh not in domain_by_hash:
+            raise RouteTamperError(
+                f"missing_domain_row: {mh} (subject={subject})",
+                failure_mode="missing_domain_row",
+            )
+
+    deposit_by_hash = {d["manifest_hash"]: d for d in deposits}
+    for row in domain_rows:
+        mh = row["manifest_hash"]
+        dep = deposit_by_hash.get(mh)
+        if (
+            dep is None
+            or dep.get("store_kind") != _USE_TERMS_STORE_KIND
+            or dep.get("target_key") != subject
+        ):
+            raise RouteTamperError(
+                f"orphan_domain_row: {mh} (subject={subject})",
+                failure_mode="orphan_domain_row",
+            )
+
+
+def resolve_use_terms(
+    subject: str,
+    *,
+    store: "ClaimsStore | None" = None,
+    log=None,
+    registry: "PubkeyRegistry | None" = None,
+) -> dict | None:
+    """The active (seq-max, integrity-ok, non-revoked) use declaration for *subject*.
+
+    Selection mirrors resolve_wallet exactly: the seq-max row over ALL rows
+    (tombstones included) is the ONLY candidate; that single row is
+    integrity-checked; then its revokes flag is consulted. No older row is
+    ever consulted - fail closed, never fall back to an older declaration when
+    the latest is untrustworthy. Filtering tombstones out BEFORE selection
+    would re-grant permission after revocation.
+
+    Returns None when no active declaration exists (absent, revoked, or the
+    latest row fails the integrity bind - each integrity failure logs a WARN
+    naming the manifest_hash and its distinct failure_mode, so tamper is never
+    a silent "undeclared"). Otherwise returns the pinned consumer-visible
+    shape, read from the VERIFIED ClaimIntegrityResult.payload - never from
+    raw domain-row columns.
+
+    declared_by is present in the return because the entitlement cross-check
+    is the CONSUMER's job: a third party CAN declare on any work hash and
+    every integrity check passes - the machine reports WHO declared, never who
+    was entitled. Disputes go to the social layer.
+    """
+    from zephyr.attribution import get_recorder
+
+    st = store if store is not None else get_claims_store()
+    lg = log if log is not None else get_recorder()
+
+    _validate_use_subject(subject)
+
+    deposits = lg.list_by_store_kind_and_key(_USE_TERMS_STORE_KIND, subject)
+    domain_rows = st.list_use_terms_for_subject(subject)
+    _assert_use_terms_deposit_parity(subject, deposits, domain_rows)
+
+    if not domain_rows:
+        return None
+
+    latest = max(domain_rows, key=lambda r: r["seq"])
+
+    result = verify_use_terms_row(latest, log=log, registry=registry)
+    if not result.ok:
+        _log.warning(
+            "resolve_use_terms: failing closed on seq=%s manifest_hash=%s (subject=%s) "
+            "- integrity bind failed (%s)",
+            latest["seq"], latest["manifest_hash"], subject, result.failure_mode,
+        )
+        return None
+
+    if latest["revokes"]:
+        return None
+
+    body = result.payload["use_terms"]
+    return {
+        "subject": body["subject"],
+        "declared_by": body["declared_by"],
+        "allowed_uses": list(body["allowed_uses"]),
+        "denied_uses": list(body["denied_uses"]),
+        "scope": body["scope"],
+        "revokes": body["revokes"],
+        "seq": latest["seq"],
+        "manifest_hash": latest["manifest_hash"],
+        "verification": (result.envelope or {}).get("verification_status") or "verified",
+    }
+
+
+def check_use(
+    subject: str,
+    use: str,
+    *,
+    store: "ClaimsStore | None" = None,
+    log=None,
+    registry: "PubkeyRegistry | None" = None,
+) -> str:
+    """Tri-state report on *use* for the work *subject*: permitted|denied|undeclared.
+
+    The permission-void, mirrored from SplitPolicy: the machine makes no claim
+    about what you may do - it proves what was DECLARED, and the absence of a
+    declaration is itself visible. "undeclared" is never permission and is
+    never more permissive than a prior "denied"; what "undeclared" means for an
+    activity is the DOWNSTREAM CONSUMER's call, never Zephyr's.
+
+    An unknown *use* token raises ValueError listing USE_VOCAB - an unknown
+    token is never tri-stated.
+    """
+    if use not in USE_VOCAB:
+        raise ValueError(
+            f"check_use: use={use!r} is not in the use vocabulary {USE_VOCAB}"
+        )
+
+    declaration = resolve_use_terms(subject, store=store, log=log, registry=registry)
+    if declaration is None:
+        return "undeclared"
+    if use in declaration["denied_uses"]:
+        return "denied"
+    if use in declaration["allowed_uses"]:
+        return "permitted"
+    return "undeclared"
 
 
 # ---------------------------------------------------------------------------

@@ -320,3 +320,196 @@ def test_demo_emit_json_schema_valid():
             os.environ["ZEPHYR_ATTRIBUTION_DB"] = old_attr_db
         else:
             os.environ.pop("ZEPHYR_ATTRIBUTION_DB", None)
+
+
+# ---------------------------------------------------------------------------
+# Consent of use (rail zephyr-use-terms-consent-v0, D2)
+#
+# The consent scene runs between act-1-deposit and act-2-remix, and the remix
+# consult is anchored IMMEDIATELY BEFORE the functional remix deposit (the
+# make_signed_deposit(... derived_from=manifest_original ...) call), so a
+# non-"permitted" report means the remix never reaches the attribution log at
+# all. All three consumer outcomes are asserted distinctly, and the
+# third-party training bot (net-new actor "crawler") is asserted too.
+# ---------------------------------------------------------------------------
+
+
+def _run_consent_demo(tmp_root, consent_declaration):
+    """Set up an isolated demo run and return (results, capture_doc, paths)."""
+    import json as _json
+    import sys as _sys
+
+    tmp_dir = Path(tmp_root)
+    keys_dir = tmp_dir / "demo-keys"
+    wallet_map_path = tmp_dir / "wallet_map.json"
+    registry_dir = tmp_dir / "registry"
+    registry_dir.mkdir(exist_ok=True)
+    attr_db = tmp_dir / "attribution.db"
+    queue_db = tmp_dir / "intent_queue.db"
+    ledger_db = tmp_dir / "ledger.db"
+    emit_path = tmp_dir / "capture.json"
+
+    old = {
+        k: os.environ.get(k)
+        for k in ("ZEPHYR_KEYS_DIR", "ZEPHYR_INTENT_QUEUE_DB", "ZEPHYR_ATTRIBUTION_DB", "ZEPHYR_CLAIMS_DB")
+    }
+    os.environ["ZEPHYR_KEYS_DIR"] = str(registry_dir)
+    os.environ["ZEPHYR_INTENT_QUEUE_DB"] = str(queue_db)
+    os.environ["ZEPHYR_ATTRIBUTION_DB"] = str(attr_db)
+    os.environ["ZEPHYR_CLAIMS_DB"] = str(tmp_dir / "claims.db")
+
+    deleted = {}
+    for mod in list(_sys.modules.keys()):
+        if "zephyr" in mod or "fixture" in mod or "settler" in mod:
+            deleted[mod] = _sys.modules[mod]
+            del _sys.modules[mod]
+
+    try:
+        from fixtures.setup_demo import setup_demo
+
+        setup_result = setup_demo(
+            num_contributors=3,
+            output_env_file=None,
+            keys_dir=keys_dir,
+            wallet_map_path=wallet_map_path,
+            registry_dir=registry_dir,
+        )
+        from demo.run_demo import run_demo
+
+        demo_env = {
+            "ZEPHYR_DEMO_KEYS_DIR": str(keys_dir),
+            "ZEPHYR_DEMO_CONTRIBUTORS": _json.dumps(setup_result["contributors"]),
+            "ZEPHYR_SETTLER_WALLET_MAP": str(wallet_map_path),
+            "ZEPHYR_SETTLER_SOURCE_WALLET": "https://wallet.interledger-test.dev/zephyr-settler-source",
+        }
+        results = run_demo(
+            demo_env,
+            dry_run=True,
+            emit_json_path=emit_path,
+            attr_db=attr_db,
+            queue_db=queue_db,
+            ledger_db=ledger_db,
+            consent_declaration=consent_declaration,
+        )
+        doc = _json.loads(emit_path.read_text()) if emit_path.exists() else None
+        return results, doc, attr_db, registry_dir
+    finally:
+        for mod, obj in deleted.items():
+            _sys.modules[mod] = obj
+        for k, v in old.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+
+def test_demo_consent_permitted_remix_proceeds():
+    """permitted -> the remix is deposited, lineage recorded, act-1b ships."""
+    with tempfile.TemporaryDirectory(prefix="zephyr-consent-permitted-") as td:
+        results, doc, attr_db, registry_dir = _run_consent_demo(td, None)
+
+        assert results["consent"]["remix_use"] == "permitted"
+        assert results["consent"]["training_use"] == "denied"
+        assert results["consent"]["declared"] is True
+        assert "remix_skipped" not in results["consent"]
+        # the remix really is in the log
+        remix_mh = next(c["manifest_hash"] for c in results["contributors"] if c["role"] == "remixer")
+        from zephyr.attribution import AttributionLog
+
+        row = AttributionLog(attr_db).get(remix_mh)
+        assert row is not None and row["derived_from"] is not None
+
+        scenes = {s["id"]: s for s in doc["scenes"]}
+        assert "act-1b-consent" in scenes, list(scenes)
+        order = [s["id"] for s in doc["scenes"]]
+        assert order.index("act-1b-consent") == order.index("act-1-deposit") + 1
+        consent = scenes["act-1b-consent"]
+        kinds = {e["kind"] for e in consent["events"]}
+        assert {"consent_declaration", "consent_report", "consent_check"} <= kinds
+        bot = next(e for e in consent["events"] if e["kind"] == "consent_check")
+        assert bot["from"] == "crawler"
+        assert bot["detail"]["report"] == "denied"
+        assert bot["detail"]["action"] == "skip"
+        # remix scene deposited normally
+        assert any(e["kind"] == "deposit" for e in scenes["act-2-remix"]["events"])
+        assert not any(e["kind"] == "consent_skip" for e in scenes["act-2-remix"]["events"])
+
+
+def test_demo_consent_denied_remix_skips():
+    """denied -> the remix is never deposited, and the skip is a logged beat."""
+    with tempfile.TemporaryDirectory(prefix="zephyr-consent-denied-") as td:
+        results, doc, attr_db, registry_dir = _run_consent_demo(
+            td, {"allowed_uses": ["redistribution"], "denied_uses": ["remix", "training"]}
+        )
+
+        assert results["consent"]["remix_use"] == "denied"
+        assert results["consent"]["remix_skipped"] is True
+        assert not any(c["role"] == "remixer" for c in results["contributors"])
+        assert results["settled"] == []
+
+        from zephyr.attribution import AttributionLog
+
+        log = AttributionLog(attr_db)
+        remix_mh = "sha256:9ebd0fd52e5cf445a66805cd97fe6bfd59cb34eb4a57c0f19f42e831aef59598"
+        assert log.get(remix_mh) is None, "a denied remix must never reach the log"
+
+        scenes = {s["id"]: s for s in doc["scenes"]}
+        assert any(e["kind"] == "consent_skip" for e in scenes["act-2-remix"]["events"])
+        skip = next(e for e in scenes["act-2-remix"]["events"] if e["kind"] == "consent_skip")
+        assert skip["detail"]["report"] == "denied"
+
+
+def test_demo_consent_undeclared_remix_skips_conservatively():
+    """undeclared (nothing declared) -> the v0 consumer skips: undeclared is
+    never permission."""
+    with tempfile.TemporaryDirectory(prefix="zephyr-consent-undeclared-") as td:
+        results, doc, attr_db, registry_dir = _run_consent_demo(td, {"declare": False})
+
+        assert results["consent"]["declared"] is False
+        assert results["consent"]["remix_use"] == "undeclared"
+        assert results["consent"]["training_use"] == "undeclared"
+        assert results["consent"]["remix_skipped"] is True
+        assert not any(c["role"] == "remixer" for c in results["contributors"])
+
+        scenes = {s["id"]: s for s in doc["scenes"]}
+        report = next(e for e in scenes["act-1b-consent"]["events"] if e["kind"] == "consent_report")
+        assert report["detail"]["remix"] == "undeclared"
+        assert report["detail"]["vocabulary"] == ["training", "remix", "redistribution"]
+        bot = next(e for e in scenes["act-1b-consent"]["events"] if e["kind"] == "consent_check")
+        assert bot["detail"]["report"] == "undeclared" and bot["detail"]["action"] == "skip"
+        assert any(e["kind"] == "consent_skip" for e in scenes["act-2-remix"]["events"])
+
+
+def test_demo_consent_revoked_declarator_never_honored_above_denied():
+    """The training bot's own law: a revoked declarator key turns the report
+    from 'denied' into 'undeclared', and the bot skips BOTH - it never treats
+    undeclared as more permissive than the prior denied."""
+    with tempfile.TemporaryDirectory(prefix="zephyr-consent-revoked-") as td:
+        results, doc, attr_db, registry_dir = _run_consent_demo(
+            td, {"allowed_uses": ["remix"], "denied_uses": ["training"], "revoke_declarator_key": True}
+        )
+
+        assert results["consent"]["declarator_key_revoked"] is True
+        assert results["consent"]["training_use"] == "undeclared"
+        assert results["consent"]["remix_use"] == "undeclared"
+        assert results["consent"]["remix_skipped"] is True
+
+        scenes = {s["id"]: s for s in doc["scenes"]}
+        bot = next(e for e in scenes["act-1b-consent"]["events"] if e["kind"] == "consent_check")
+        assert bot["detail"]["report"] == "undeclared"
+        assert bot["detail"]["action"] == "skip", "undeclared must never be honored above denied"
+
+
+def test_demo_consent_uses_only_the_closed_vocabulary():
+    """The scene's declaration is written against the shipped vocabulary, and
+    an out-of-vocabulary declaration is refused before anything is deposited."""
+    with tempfile.TemporaryDirectory(prefix="zephyr-consent-vocab-") as td:
+        results, doc, attr_db, registry_dir = _run_consent_demo(td, None)
+        scenes = {s["id"]: s for s in doc["scenes"]}
+        decl = next(e for e in scenes["act-1b-consent"]["events"] if e["kind"] == "consent_declaration")
+        assert set(decl["detail"]["allowed_uses"]) | set(decl["detail"]["denied_uses"]) <= {
+            "training", "remix", "redistribution"
+        }
+        # declared_by is reported (the consumer's entitlement cross-check needs it)
+        assert decl["detail"]["declared_by"]
+        assert "never proof of entitlement" in decl["detail"]["note"]
